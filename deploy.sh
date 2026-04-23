@@ -9,78 +9,39 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# 打印函数
 info() { echo -e "${GREEN}[INFO] $1${NC}"; }
 warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
 error() { echo -e "${RED}[ERROR] $1${NC}"; exit 1; }
 success() { echo -e "${CYAN}[SUCCESS] $1${NC}"; }
 
+# 检查 root 权限
 check_root() {
     [[ $EUID -ne 0 ]] && error "请使用 root 用户运行此脚本"
 }
 
-# ===== 修复1: 系统检测和包管理器更新分离 =====
+# 检测系统
 detect_system() {
     if [[ -f /etc/debian_version ]]; then
         PM="apt"
         SYSTEM="debian"
+        $PM update -y
     elif [[ -f /etc/redhat-release ]]; then
         PM="yum"
         SYSTEM="redhat"
+        $PM update -y
     else
         error "不支持的系统"
     fi
 }
 
-# 只在需要安装依赖时才更新包管理器
-update_package_manager() {
-    info "更新包管理器..."
-    $PM update -y
-}
-
-# ===== 修复2: 检查依赖是否已安装 =====
-check_dependencies_installed() {
-    local missing=0
-    for pkg in curl wget jq openssl certbot qrencode net-tools unzip; do
-        if ! command -v "$pkg" &> /dev/null && ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" && ! rpm -q "$pkg" &> /dev/null; then
-            missing=1
-            break
-        fi
-    done
-    return $missing
-}
-
+# 安装依赖
 install_dependencies() {
-    # 先检查是否已安装
-    if check_dependencies_installed; then
-        info "依赖已安装，跳过"
-        return 0
-    fi
-    
-    info "安装缺失依赖..."
-    
-    # 检查每个包，只安装缺失的
-    local packages_to_install=""
-    for pkg in curl wget jq openssl certbot qrencode net-tools unzip; do
-        case $SYSTEM in
-            debian)
-                if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-                    packages_to_install="$packages_to_install $pkg"
-                fi
-                ;;
-            redhat)
-                if ! rpm -q "$pkg" &> /dev/null; then
-                    packages_to_install="$packages_to_install $pkg"
-                fi
-                ;;
-        esac
-    done
-    
-    if [[ -n "$packages_to_install" ]]; then
-        info "安装: $packages_to_install"
-        $PM install -y $packages_to_install
-    fi
+    info "安装依赖..."
+    $PM install -y curl wget jq openssl certbot qrencode net-tools unzip
 }
 
+# 安装 Xray
 install_xray() {
     if command -v xray &> /dev/null; then
         info "Xray 已安装: $(xray version | head -1)"
@@ -118,6 +79,7 @@ install_xray() {
     mkdir -p /var/log/xray
 }
 
+# 检查 Xray 是否已部署
 check_xray_deployed() {
     if [[ -f "/usr/local/etc/xray/config.json" ]] && command -v xray &> /dev/null; then
         return 0
@@ -126,6 +88,7 @@ check_xray_deployed() {
     fi
 }
 
+# 查看当前部署信息
 view_current_deploy() {
     if [[ ! -f "/usr/local/etc/xray/config.json" ]]; then
         warn "未找到配置文件"
@@ -166,6 +129,7 @@ view_current_deploy() {
     echo -e "${BLUE}================================================${NC}"
 }
 
+# 重新部署功能
 redeploy_xray() {
     echo ""
     warn "重新部署将覆盖当前配置"
@@ -195,6 +159,7 @@ redeploy_xray() {
     esac
 }
 
+# 保留 UUID 重新部署
 redeploy_keep_uuid() {
     info "保留 UUID 重新部署..."
     
@@ -210,6 +175,7 @@ redeploy_keep_uuid() {
     redeploy_common
 }
 
+# 全部重新生成
 redeploy_full() {
     info "全部重新生成..."
     
@@ -219,6 +185,7 @@ redeploy_full() {
     redeploy_common
 }
 
+# 只更新 Reality 密钥
 redeploy_update_keys() {
     if [[ ! -f "/usr/local/etc/xray/config.json" ]]; then
         error "未找到配置文件"
@@ -262,6 +229,7 @@ redeploy_update_keys() {
     restart_and_show
 }
 
+# 只更换端口
 redeploy_change_port() {
     info "更换端口..."
     
@@ -294,6 +262,7 @@ redeploy_change_port() {
     systemctl is-active --quiet xray && success "服务已重启" || warn "重启失败"
 }
 
+# 重新部署通用流程 - 修复版
 redeploy_common() {
     select_protocol
     
@@ -306,6 +275,7 @@ redeploy_common() {
     read -p "请输入备注名称 [默认xray]: " REMARK
     REMARK=${REMARK:-"xray"}
     
+    # 只有 VMess 或双协议才需要域名
     if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
         read -p "请输入你的域名 (VMess 需要): " DOMAIN
         [[ -z "$DOMAIN" ]] && error "域名不能为空"
@@ -313,6 +283,7 @@ redeploy_common() {
         DOMAIN=""
     fi
     
+    # Reality 配置
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
         get_reality_input
     fi
@@ -328,6 +299,7 @@ redeploy_common() {
     restart_and_show
 }
 
+# 重启服务并显示配置
 restart_and_show() {
     info "验证配置..."
     
@@ -354,7 +326,8 @@ restart_and_show() {
     success "重新部署完成！"
 }
 
-# BBR
+# BBR 相关功能
+
 check_kernel_version() {
     local KERNEL_VERSION=$(uname -r | cut -d '-' -f 1)
     local MIN_VERSION="4.9"
@@ -426,7 +399,7 @@ view_bbr_status() {
     echo -e "${BLUE}================================================${NC}"
     
     echo -e "${YELLOW}内核版本:${NC} $(uname -r)"
-    echo -e "${YELLOW}TCP 拥塞控制:${NC} $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+    echo -e "${YELLOW}TCP 拥塞控制:${NC} $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')"
     
     echo -e "${BLUE}================================================${NC}"
     
@@ -437,6 +410,7 @@ view_bbr_status() {
     fi
 }
 
+# 选择协议
 select_protocol() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
@@ -450,40 +424,93 @@ select_protocol() {
     PROTOCOL_CHOICE=${PROTOCOL_CHOICE:-1}
 }
 
+# 生成 Reality 密钥 - 核心修复函数
 generate_reality_keys() {
     info "生成 Reality 密钥对..."
     
-    local KEYS_RAW=$(xray x25519 2>&1)
+    # 使用 xray x25519 生成密钥
+    local KEYS_RAW
+    KEYS_RAW=$(xray x25519 2>&1)
     
-    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -i "private" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -i "public" | awk '{print $NF}')
+    # 显示原始输出便于调试
+    info "xray x25519 输出:"
+    echo "$KEYS_RAW"
+    echo ""
     
+    # 解析密钥 - 使用更精确的方法
+    # 格式通常是: "Private key: xxxx" 或 "PrivateKey: xxxx"
+    
+    # 提取 Private key - 只取密钥值，不包含前缀
+    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -i "private" | sed 's/Private[Kk]ey://i' | sed 's/Private key://i' | tr -d '[:space:]')
+    
+    # 提取 Public key - 只取密钥值，不包含前缀
+    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -i "public" | sed 's/Public[Kk]ey://i' | sed 's/Public key://i' | tr -d '[:space:]')
+    
+    # 如果解析失败，尝试另一种方式
+    if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+        # 尝试按行解析
+        local LINE1=$(echo "$KEYS_RAW" | head -1)
+        local LINE2=$(echo "$KEYS_RAW" | tail -1)
+        
+        PRIVATE_KEY=$(echo "$LINE1" | awk '{print $NF}')
+        PUBLIC_KEY=$(echo "$LINE2" | awk '{print $NF}')
+    fi
+    
+    # 验证密钥有效性
     if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
-        info "密钥生成成功"
+        info "密钥自动生成成功"
         info "Private Key: $PRIVATE_KEY"
         info "Public Key: $PUBLIC_KEY"
         return 0
     fi
     
-    warn "自动生成失败，请手动输入密钥值"
+    # 自动生成失败，提示手动输入
+    warn "自动解析密钥失败"
+    warn "请查看上方输出，手动提取密钥值"
+    echo ""
+    echo -e "${YELLOW}正确格式示例:${NC}"
+    echo "  Private key: GBzsn_jFxmdVbMR64oiYs_sIE0c3hrq0A_w2wTakOUQ"
+    echo "  Public key:  abcdefghijklmnopqrstuvwxyz1234567890ABCDEF"
+    echo ""
+    echo -e "${YELLOW}只需输入密钥值 (冒号后面的部分):${NC}"
     echo ""
     
-    read -p "Private Key: " PRIVATE_KEY
-    read -p "Public Key: " PUBLIC_KEY
-    
-    PRIVATE_KEY=$(echo "$PRIVATE_KEY" | awk '{print $NF}')
-    PUBLIC_KEY=$(echo "$PUBLIC_KEY" | awk '{print $NF}')
+    while true; do
+        read -p "请输入 Private Key 值: " PRIVATE_KEY
+        read -p "请输入 Public Key 值: " PUBLIC_KEY
+        
+        if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+            warn "密钥不能为空"
+            continue
+        fi
+        
+        # 移除可能的前缀 (防止用户输入了完整行)
+        PRIVATE_KEY=$(echo "$PRIVATE_KEY" | sed 's/Private[Kk]ey://i' | sed 's/Private key://i' | tr -d '[:space:]')
+        PUBLIC_KEY=$(echo "$PUBLIC_KEY" | sed 's/Public[Kk]ey://i' | sed 's/Public key://i' | tr -d '[:space:]')
+        
+        if [[ ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
+            break
+        else
+            warn "密钥长度异常，请确认 (长度应 ≥ 40)"
+            warn "Private: ${#PRIVATE_KEY}, Public: ${#PUBLIC_KEY}"
+            read -p "是否继续? [y/N]: " confirm
+            [[ "$confirm" == "y" || "$confirm" == "Y" ]] && break
+        fi
+    done
     
     info "Private Key: $PRIVATE_KEY"
     info "Public Key: $PUBLIC_KEY"
+    return 0
 }
 
+# Reality 配置输入
 get_reality_input() {
     generate_reality_keys
     
     SHORT_ID=$(openssl rand -hex 8)
     info "Short ID: $SHORT_ID"
     
+    # 选择回落目标
     echo ""
     echo -e "${PURPLE}请选择回落目标 (dest):${NC}"
     echo -e "  ${GREEN}1${NC}. www.microsoft.com (推荐)"
@@ -509,6 +536,7 @@ get_reality_input() {
     
     info "回落目标: ${DEST}:${DEST_PORT}"
     
+    # 选择指纹
     echo ""
     echo -e "${PURPLE}请选择 TLS 指纹:${NC}"
     echo -e "  ${GREEN}1${NC}. chrome (推荐)"
@@ -521,6 +549,7 @@ get_reality_input() {
     info "TLS 指纹: $FINGERPRINT"
 }
 
+# 申请证书
 get_cert() {
     if [[ "$PROTOCOL_CHOICE" == "1" ]]; then
         info "VLESS + Reality 无需证书"
@@ -559,6 +588,7 @@ get_cert() {
     info "证书申请成功"
 }
 
+# 生成 Reality 服务端配置
 gen_reality_server_config() {
     info "生成 VLESS + Reality 服务端配置..."
     
@@ -639,6 +669,7 @@ gen_reality_server_config() {
 EOF
 }
 
+# 生成 VMess 服务端配置
 gen_vmess_server_config() {
     info "生成 VMess + TLS + WebSocket 服务端配置..."
     
@@ -724,6 +755,7 @@ gen_vmess_server_config() {
 EOF
 }
 
+# 生成双协议服务端配置
 gen_dual_server_config() {
     info "生成双协议服务端配置..."
     
@@ -853,6 +885,7 @@ EOF
     VMESS_PORT_FINAL=$VMESS_PORT
 }
 
+# 创建 systemd 服务
 create_systemd_service() {
     info "创建 systemd 服务..."
     
@@ -877,6 +910,7 @@ EOF
     systemctl daemon-reload
 }
 
+# 启动服务
 start_service() {
     info "验证配置文件..."
     
@@ -899,10 +933,12 @@ start_service() {
     fi
 }
 
+# 生成 VLESS Reality 链接
 gen_vless_reality_link() {
     VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${REMARK}"
 }
 
+# 生成 VMess 链接
 gen_vmess_link() {
     local PORT_USE=${VMESS_PORT_FINAL:-$PORT}
     
@@ -912,6 +948,7 @@ gen_vmess_link() {
     VMESS_LINK="vmess://${vmess_base64}"
 }
 
+# 生成二维码
 gen_qrcode() {
     info "生成二维码..."
     
@@ -985,6 +1022,7 @@ gen_qrcode() {
     echo -e "${BLUE}================================================${NC}"
 }
 
+# 生成客户端 JSON 配置
 gen_client_config() {
     echo ""
     echo -e "${PURPLE}================================================${NC}"
@@ -1067,6 +1105,7 @@ EOF
     echo -e "${PURPLE}================================================${NC}"
 }
 
+# 保存配置到文件
 save_config() {
     local config_file="/root/xray-client.txt"
     
@@ -1124,6 +1163,7 @@ EOF
     info "配置已保存到: $config_file"
 }
 
+# 设置证书自动续期
 setup_cert_renewal() {
     if [[ "$PROTOCOL_CHOICE" == "1" ]]; then
         info "VLESS + Reality 无需证书续期"
@@ -1134,6 +1174,7 @@ setup_cert_renewal() {
     (crontab -l 2>/dev/null | grep -v "certbot renew"; echo "0 3 * * * certbot renew --quiet && systemctl restart xray") | crontab -
 }
 
+# 卸载
 uninstall() {
     echo ""
     warn "即将卸载 Xray..."
@@ -1152,6 +1193,7 @@ uninstall() {
     info "Xray 已卸载"
 }
 
+# 查看配置
 view_config() {
     if [[ ! -f "/root/xray-client.txt" ]]; then
         warn "配置文件不存在"
@@ -1177,6 +1219,7 @@ view_config() {
     fi
 }
 
+# 查看日志
 view_logs() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
@@ -1186,6 +1229,7 @@ view_logs() {
     journalctl -u xray --no-pager -n 30
 }
 
+# 显示菜单
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
@@ -1219,21 +1263,19 @@ show_menu() {
     fi
 }
 
-# ===== 修复3: 新安装时才更新包管理器和安装依赖 =====
+# 新安装流程 - 修复版
 install_new() {
-    # 1. 只在安装时更新包管理器
-    update_package_manager
-    
-    # 2. 安装依赖（已安装的会跳过）
     install_dependencies
-    
-    # 3. 安装 Xray
     install_xray
     
-    # 4. 选择协议
+    echo ""
+    read -p "是否开启 BBR 加速? [Y/n]: " enable_bbr_choice
+    enable_bbr_choice=${enable_bbr_choice:-Y}
+    
+    [[ "$enable_bbr_choice" == "y" || "$enable_bbr_choice" == "Y" ]] && enable_bbr
+    
     select_protocol
     
-    # 5. 获取基本信息
     SERVER_IP=$(curl -s4 ip.sb || curl -s6 ip.sb)
     info "服务器 IP: $SERVER_IP"
     
@@ -1246,7 +1288,7 @@ install_new() {
     UUID=$(xray uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
     info "生成的 UUID: $UUID"
     
-    # 6. VMess 需要域名
+    # 只有 VMess 或双协议才需要域名
     if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
         echo ""
         read -p "请输入你的域名 (VMess + TLS 需要): " DOMAIN
@@ -1256,43 +1298,32 @@ install_new() {
         info "VLESS + Reality 无需域名"
     fi
     
-    # 7. Reality 配置
+    # Reality 配置
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
         get_reality_input
     fi
     
-    # 8. 申请证书
+    # 申请证书
     get_cert
     
-    # 9. 生成配置
+    # 生成配置
     case $PROTOCOL_CHOICE in
         1) gen_reality_server_config ;;
         2) gen_vmess_server_config ;;
         3) gen_dual_server_config ;;
     esac
     
-    # 10. 启动服务
     create_systemd_service
     start_service
     setup_cert_renewal
-    
-    # 11. 显示配置
     gen_qrcode
     gen_client_config
     save_config
     
-    # 12. 最后询问 BBR
-    echo ""
-    read -p "是否开启 BBR 加速? [Y/n]: " enable_bbr_choice
-    enable_bbr_choice=${enable_bbr_choice:-Y}
-    
-    if [[ "$enable_bbr_choice" == "y" || "$enable_bbr_choice" == "Y" ]]; then
-        enable_bbr
-    fi
-    
     success "安装完成！"
 }
 
+# 主函数
 main() {
     check_root
     detect_system

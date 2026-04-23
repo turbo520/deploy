@@ -1,4 +1,3 @@
-cat > /tmp/xray_install_fixed.sh << 'SCRIPT_EOF'
 #!/bin/bash
 
 # 颜色定义
@@ -1339,5 +1338,3 @@ main() {
 }
 
 main
-SCRIPT_EOF
-echo "脚本已生成到 /tmp/xray_install_fixed.sh"

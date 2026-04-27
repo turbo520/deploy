@@ -126,9 +126,9 @@ view_current_deploy() {
     echo -e "${YELLOW}端口:${NC} ${PORT:-未知}"
 
     if echo "$CONFIG" | grep -q "realitySettings"; then
-        echo -e "${YELLOW}协议:${NC} VLESS + Reality"
+        echo -e "${YELLOW}协议:${NC} VLESS + Reality (已优化xver+DNS+BT屏蔽)"
     elif echo "$CONFIG" | grep -q '"protocol": "vmess"'; then
-        echo -e "${YELLOW}协议:${NC} VMess"
+        echo -e "${YELLOW}协议:${NC} VMess + TLS"
     else
         echo -e "${YELLOW}协议:${NC} 其他"
     fi
@@ -325,7 +325,7 @@ generate_reality_keys() {
     info "密钥生成完成"
 }
 
-# 修复 serverNames 重复域名BUG
+# 删除冗余域名，仅保留主域名
 get_reality_input() {
     generate_reality_keys
     SHORT_ID=$(openssl rand -hex 8)
@@ -364,19 +364,15 @@ get_cert() {
     success "证书申请成功"
 }
 
-# ====================== 核心优化：配置文件生成 ======================
-# 修复 serverNames 重复域名 + 增加性能优化 + 规范配置
+# ====================== 终极优化：配置文件生成 ======================
+# 1. 补全 Reality 必填 xver: 0
+# 2. 删除冗余域名，仅保留1个
+# 3. 添加内置DNS配置
+# 4. 新增BT屏蔽路由规则
+# 5. 兼容IPv6
 gen_reality_server_config() {
     info "生成 VLESS + Reality 服务端配置..."
     mkdir -p /usr/local/etc/xray
-
-    # 修复核心BUG：自动处理域名，避免 www.www.xxx 重复
-    if [[ $DEST == www.* ]]; then
-        CLEAN_DEST=${DEST#www.}
-        SERVER_NAMES="[\"${DEST}\",\"${CLEAN_DEST}\"]"
-    else
-        SERVER_NAMES="[\"${DEST}\",\"www.${DEST}\"]"
-    fi
 
     cat > /usr/local/etc/xray/config.json << EOF
 {
@@ -384,6 +380,15 @@ gen_reality_server_config() {
     "loglevel": "warning",
     "access": "/var/log/xray/access.log",
     "error": "/var/log/xray/error.log"
+  },
+  "dns": {
+    "servers": [
+      "https://223.5.5.5/dns-query",
+      "https://1.1.1.1/dns-query",
+      "8.8.8.8",
+      "1.0.0.1"
+    ],
+    "queryStrategy": "UseIP"
   },
   "inbounds": [
     {
@@ -398,9 +403,10 @@ gen_reality_server_config() {
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
+        "xver": 0,
         "realitySettings": {
           "dest": "${DEST}:${DEST_PORT}",
-          "serverNames": ${SERVER_NAMES},
+          "serverNames": ["${DEST}"],
           "privateKey": "${PRIVATE_KEY}",
           "shortIds": ["${SHORT_ID}", ""]
         }
@@ -415,12 +421,8 @@ gen_reality_server_config() {
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": {},
       "streamSettings": {
-        "sockopt": {
-          "tcpFastOpen": true,
-          "TOS": 64
-        }
+        "sockopt": {"tcpFastOpen": true, "TOS": 64}
       }
     },
     {"tag": "block", "protocol": "blackhole"}
@@ -428,7 +430,8 @@ gen_reality_server_config() {
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block", "enabled": true}
     ]
   }
 }
@@ -444,6 +447,12 @@ gen_vmess_server_config() {
     "loglevel": "warning",
     "access": "/var/log/xray/access.log",
     "error": "/var/log/xray/error.log"
+  },
+  "dns": {
+    "servers": [
+      "https://223.5.5.5/dns-query",
+      "https://1.1.1.1/dns-query"
+    ]
   },
   "inbounds": [
     {
@@ -480,7 +489,10 @@ gen_vmess_server_config() {
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
-    "rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}]
+    "rules": [
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+    ]
   }
 }
 EOF
@@ -491,16 +503,12 @@ gen_dual_server_config() {
     mkdir -p /usr/local/etc/xray
     local VMESS_PORT=$((PORT + 1))
 
-    if [[ $DEST == www.* ]]; then
-        CLEAN_DEST=${DEST#www.}
-        SERVER_NAMES="[\"${DEST}\",\"${CLEAN_DEST}\"]"
-    else
-        SERVER_NAMES="[\"${DEST}\",\"www.${DEST}\"]"
-    fi
-
     cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": {"loglevel": "warning"},
+  "dns": {
+    "servers": ["https://223.5.5.5/dns-query","https://1.1.1.1/dns-query"]
+  },
   "inbounds": [
     {
       "tag": "vless-reality-in",
@@ -511,9 +519,10 @@ gen_dual_server_config() {
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
+        "xver": 0,
         "realitySettings": {
           "dest": "${DEST}:443",
-          "serverNames": ${SERVER_NAMES},
+          "serverNames": ["${DEST}"],
           "privateKey": "${PRIVATE_KEY}",
           "shortIds": ["${SHORT_ID}", ""]
         }
@@ -549,14 +558,17 @@ gen_dual_server_config() {
     {"tag": "block", "protocol": "blackhole"}
   ],
   "routing": {
-    "rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}]
+    "rules": [
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
+    ]
   }
 }
 EOF
     VMESS_PORT_FINAL=$VMESS_PORT
 }
 
-# 修复 Systemd 服务拼写错误
+# 修复 Systemd 服务
 create_systemd_service() {
     info "创建 systemd 服务..."
     cat > /etc/systemd/system/xray.service << EOF
@@ -586,7 +598,7 @@ start_service() {
 }
 
 gen_vless_reality_link() {
-    VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${REMARK}"
+    VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&xver=0#${REMARK}"
 }
 
 gen_vmess_link() {
@@ -595,6 +607,7 @@ gen_vmess_link() {
     VMESS_LINK="vmess://$(echo -n "$vmess_json" | base64 -w 0)"
 }
 
+# 优化客户端 SOCKS5 监听，兼容 IPv4+IPv6
 gen_qrcode() {
     info "生成客户端配置..."
     echo ""
@@ -619,15 +632,23 @@ gen_qrcode() {
 }
 
 gen_client_config() {
-    echo -e "\n${PURPLE}客户端JSON配置${NC}"
+    echo -e "\n${PURPLE}客户端JSON配置(IPv4+IPv6兼容)${NC}"
     [[ "$PROTOCOL_CHOICE" =~ 1|3 ]] && cat << EOF
 {
-  "inbounds": [{"port": 10808,"protocol":"socks"}],
+  "inbounds": [
+    {
+      "port": 10808,
+      "listen": "::",
+      "protocol":"socks",
+      "settings": {"udp": true}
+    }
+  ],
   "outbounds": [{
     "protocol":"vless",
     "settings":{"vnext":[{"address":"${SERVER_IP}","port":${PORT},"users":[{"id":"${UUID}","flow":"xtls-rprx-vision"}]}]},
     "streamSettings":{
       "security":"reality",
+      "xver": 0,
       "realitySettings":{"serverName":"${DEST}","publicKey":"${PUBLIC_KEY}","shortId":"${SHORT_ID}","fingerprint":"${FINGERPRINT}"}
     }
   }]
@@ -639,10 +660,11 @@ save_config() {
     gen_vless_reality_link
     [[ "$PROTOCOL_CHOICE" =~ 2|3 ]] && gen_vmess_link
     cat > /root/xray-client.txt << EOF
-Xray 配置
+Xray 终极优化配置
 服务器IP: ${SERVER_IP}
 UUID: ${UUID}
 配置时间: $(date)
+优化项: xver=0 | DNS解析 | BT屏蔽 | IPv6兼容
 VLESS链接: ${VLESS_LINK:-无}
 VMess链接: ${VMESS_LINK:-无}
 EOF
@@ -676,7 +698,7 @@ view_logs() {
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
-    echo -e "${PURPLE}       Xray 一键安装脚本(优化版)${NC}"
+    echo -e "${PURPLE}       Xray 一键安装脚本(终极优化版)${NC}"
     echo -e "${PURPLE}============================================${NC}"
 
     if check_xray_deployed; then

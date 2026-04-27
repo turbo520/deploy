@@ -76,7 +76,6 @@ install_xray() {
     fi
 
     info "安装 Xray..."
-    # 修复官方脚本安装方式
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root || {
         warn "官方脚本失败，尝试手动安装..."
 
@@ -673,7 +672,7 @@ view_logs() {
     journalctl -u xray --no-pager -n 30
 }
 
-# 修复菜单错别字
+# 竖向菜单（最终版）
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
@@ -681,12 +680,28 @@ show_menu() {
     echo -e "${PURPLE}============================================${NC}"
 
     if check_xray_deployed; then
-        echo -e "1.重新部署 2.查看部署 3.卸载 4.查看配置 5.日志 6.重启"
-        echo -e "7.开启BBR 8.关闭BBR 9.查看BBR 10.退出"
+        echo -e "  ${GREEN}1${NC}. 重新部署 Xray"
+        echo -e "  ${GREEN}2${NC}. 查看当前部署信息"
+        echo -e "  ${GREEN}3${NC}. 卸载 Xray"
+        echo -e "  ${GREEN}4${NC}. 查看配置信息"
+        echo -e "  ${GREEN}5${NC}. 查看日志"
+        echo -e "  ${GREEN}6${NC}. 重启 Xray"
+        echo -e "  ${GREEN}7${NC}. 开启 BBR 加速"
+        echo -e "  ${GREEN}8${NC}. 关闭 BBR 加速"
+        echo -e "  ${GREEN}9${NC}. 查看 BBR 状态"
+        echo -e "  ${GREEN}10${NC}. 退出"
     else
-        echo -e "1.安装Xray+BBR 2.卸载 3.查看配置 4.日志 5.重启"
-        echo -e "6.开启BBR 7.关闭BBR 8.查看BBR 9.退出"
+        echo -e "  ${GREEN}1${NC}. 安装 Xray + 开启 BBR"
+        echo -e "  ${GREEN}2${NC}. 卸载 Xray"
+        echo -e "  ${GREEN}3${NC}. 查看配置信息"
+        echo -e "  ${GREEN}4${NC}. 查看日志"
+        echo -e "  ${GREEN}5${NC}. 重启 Xray"
+        echo -e "  ${GREEN}6${NC}. 开启 BBR 加速"
+        echo -e "  ${GREEN}7${NC}. 关闭 BBR 加速"
+        echo -e "  ${GREEN}8${NC}. 查看 BBR 状态"
+        echo -e "  ${GREEN}9${NC}. 退出"
     fi
+    echo -e "${PURPLE}============================================${NC}"
 }
 
 install_new() {

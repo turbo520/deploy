@@ -418,39 +418,42 @@ generate_reality_keys_once() {
     info "Xray 密钥生成原始输出:"
     echo "$KEYS_RAW"
 
-    # ====================== 关键修复：正确识别私钥和公钥 ======================
-    # xray x25519 输出格式：
-    # Private key: xxxxx  (这是服务端用的 privateKey)
-    # Public key: yyyyy   (这是客户端用的 publicKey)
+    # ====================== 核心修复：适配 xray 新的三行输出格式 ======================
+    # xray x25519 输出格式（新版本）：
+    # PrivateKey: xxxxx            ← 第一行，服务端用
+    # Password (PublicKey): yyyyy  ← 第二行，客户端用（注意不是最后一行！）
+    # Hash32: zzzzz                ← 第三行，不是 PublicKey！
     #
-    # 注意：第一行是私钥，第二行是公钥！千万不要搞反！
+    # 旧版本两行格式：
+    # Private key: xxxxx
+    # Public key: yyyyy
 
-    # 方法1：按行号提取（最可靠）
-    PRIVATE_KEY=$(echo "$KEYS_RAW" | head -1 | awk '{print $NF}' | tr -d '[:space:]')
-    PUBLIC_KEY=$(echo "$KEYS_RAW" | tail -1 | awk '{print $NF}' | tr -d '[:space:]')
+    # ====================== 使用关键字方法提取（唯一可靠方法）======================
+    # PrivateKey：提取包含 "PrivateKey" 或 "Private key" 的行的最后一个字段
+    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -iE "PrivateKey|Private key" | sed -E 's/.*:[[:space:]]*//' | head -1 | tr -d '[:space:]')
 
-    # 方法2：按关键字提取（备用验证）
-    local PRIVATE_KEY_CHECK=$(echo "$KEYS_RAW" | grep -i "private" | awk '{print $NF}' | tr -d '[:space:]')
-    local PUBLIC_KEY_CHECK=$(echo "$KEYS_RAW" | grep -i "public" | awk '{print $NF}' | tr -d '[:space:]')
-
-    # 验证两种方法提取结果是否一致
-    if [[ "$PRIVATE_KEY" != "$PRIVATE_KEY_CHECK" || "$PUBLIC_KEY" != "$PUBLIC_KEY_CHECK" ]]; then
-        warn "密钥提取方法验证不一致，使用关键字方法"
-        PRIVATE_KEY="$PRIVATE_KEY_CHECK"
-        PUBLIC_KEY="$PUBLIC_KEY_CHECK"
-    fi
+    # PublicKey：提取包含 "PublicKey" 或 "Public key" 的行的最后一个字段
+    # 注意：新格式是 "Password (PublicKey): xxx"，grep -i "public" 可以匹配
+    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -iE "PublicKey|Public key" | sed -E 's/.*:[[:space:]]*//' | head -1 | tr -d '[:space:]')
 
     # 验证密钥长度 (x25519 密钥为 43 字符 Base64)
     if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
         success "密钥自动生成成功！"
-        info "私钥 PrivateKey (服务端): ${PRIVATE_KEY:0:20}... (共${#PRIVATE_KEY}字符)"
-        info "公钥 PublicKey (客户端):  ${PUBLIC_KEY:0:20}... (共${#PUBLIC_KEY}字符)"
+        info "私钥 PrivateKey (服务端): ${PRIVATE_KEY}"
+        info "公钥 PublicKey (客户端):  ${PUBLIC_KEY}"
 
-        # ====================== 关键验证：确保密钥匹配 ======================
-        # 使用 xray 的验证功能（如果可用）
-        if $XRAY_CMD x25519 -p "$PUBLIC_KEY" 2>&1 | grep -q "Private"; then
-            info "密钥配对验证通过"
-        fi
+        # 立即显示密钥配对确认
+        echo ""
+        echo -e "${BLUE}================================================${NC}"
+        echo -e "${BLUE}           密钥配对确认（请务必核对）${NC}"
+        echo -e "${BLUE}================================================${NC}"
+        echo -e "${YELLOW}服务端 privateKey (写入config.json):${NC}"
+        echo -e "${GREEN}${PRIVATE_KEY}${NC}"
+        echo ""
+        echo -e "${YELLOW}客户端 publicKey (写入链接pbk参数):${NC}"
+        echo -e "${GREEN}${PUBLIC_KEY}${NC}"
+        echo -e "${BLUE}================================================${NC}"
+        echo ""
 
         return 0
     fi
@@ -469,12 +472,17 @@ _manual_input_keys() {
     echo "1. 新开终端窗口，执行命令: ${GREEN}xray x25519${NC}"
     echo "2. 复制对应的值，只粘贴冒号后面的密钥内容"
     echo ""
-    echo -e "${YELLOW}示例输出：${NC}"
-    echo "  Private key: CFymf6Bk0GSM8NJV4qRRhacnPE-MMVh4-lIXrDMkEUA"
-    echo "  Public key: HQ-zA0fmFUcCfbR-7Y_GJDqmHayAk3aC0Et-9-DQ8mc"
+    echo -e "${YELLOW}xray 新版本输出格式（三行）：${NC}"
+    echo "  PrivateKey: 6OLyOIN1HEj8bzmbjLvR_W2cq8dJG8QQab5kJ2OmG0s"
+    echo "  Password (PublicKey): Vrcin3-g_sx5DBWxyKbLQ4dYFYdmkeETKkKFMJ6e_FE"
+    echo "  Hash32: -RP7_V5MV16NjsYOsUR7H8I69ftwUapst2kngklIZ7U"
+    echo ""
+    echo -e "${RED}注意：PublicKey 在第二行 Password (PublicKey) 后面，不是最后一行 Hash32！${NC}"
+    echo ""
     echo -e "${YELLOW}重要提示：${NC}"
-    echo -e "  ${GREEN}Private key (私钥)${NC} → 用于服务端配置"
-    echo -e "  ${GREEN}Public key (公钥)${NC} → 用于客户端链接"
+    echo -e "  ${GREEN}PrivateKey (私钥)${NC} → 第一行 → 用于服务端 config.json"
+    echo -e "  ${GREEN}Password (PublicKey) (公钥)${NC} → 第二行 → 用于客户端链接 pbk 参数"
+    echo -e "  ${RED}Hash32${NC} → 第三行 → 不要复制这个！这不是公钥！"
     echo ""
 
     while true; do

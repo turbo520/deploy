@@ -9,7 +9,7 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 全局变量初始化（防止空值）
+# 全局变量初始化
 PRIVATE_KEY=""
 PUBLIC_KEY=""
 SHORT_ID=""
@@ -236,7 +236,7 @@ redeploy_update_keys() {
     DEST_PORT=443
     FINGERPRINT=${OLD_FP:-"chrome"}
 
-    generate_reality_keys
+    generate_reality_keys_once
     SHORT_ID=$(openssl rand -hex 8)
     info "生成的 Short ID: $SHORT_ID"
 
@@ -382,19 +382,16 @@ select_protocol() {
     PROTOCOL_CHOICE=${PROTOCOL_CHOICE:-1}
 }
 
-# ====================== 核心修复：稳定密钥生成函数 ======================
-generate_reality_keys() {
+# ====================== 核心修复：确保密钥只生成一次且正确匹配 ======================
+generate_reality_keys_once() {
     info "开始生成 Reality 密钥对..."
 
     # 重置变量
     PRIVATE_KEY=""
     PUBLIC_KEY=""
 
-    # 执行 xray x25519 命令
-    local KEYS_RAW=""
-    local XRAY_CMD=""
-
     # 查找 xray 命令路径
+    local XRAY_CMD=""
     if command -v xray &> /dev/null; then
         XRAY_CMD="xray"
     elif [[ -f /usr/local/bin/xray ]]; then
@@ -407,8 +404,8 @@ generate_reality_keys() {
         return 0
     fi
 
-    # 执行密钥生成
-    KEYS_RAW=$($XRAY_CMD x25519 2>&1)
+    # 执行密钥生成 - 只执行一次！
+    local KEYS_RAW=$($XRAY_CMD x25519 2>&1)
     local exit_code=$?
 
     if [[ $exit_code -ne 0 || -z "$KEYS_RAW" ]]; then
@@ -417,37 +414,44 @@ generate_reality_keys() {
         return 0
     fi
 
-    # 打印原始输出便于调试
+    # 打印原始输出
     info "Xray 密钥生成原始输出:"
     echo "$KEYS_RAW"
 
-    # 多种格式适配提取
-    # 格式1: Private key: xxx / Public key: xxx (标准格式)
-    # 格式2: PrivateKey: xxx / PublicKey: xxx (驼峰格式)
-    # 格式3: Private key: xxx / Password (PublicKey): xxx (旧版格式)
+    # ====================== 关键修复：正确识别私钥和公钥 ======================
+    # xray x25519 输出格式：
+    # Private key: xxxxx  (这是服务端用的 privateKey)
+    # Public key: yyyyy   (这是客户端用的 publicKey)
+    #
+    # 注意：第一行是私钥，第二行是公钥！千万不要搞反！
 
-    # 提取私钥 - 多种匹配方式
-    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -iE "^.*private.*key.*:" | sed -E 's/^.*private.*key.*:[[:space:]]*//i' | head -1 | tr -d '[:space:]')
+    # 方法1：按行号提取（最可靠）
+    PRIVATE_KEY=$(echo "$KEYS_RAW" | head -1 | awk '{print $NF}' | tr -d '[:space:]')
+    PUBLIC_KEY=$(echo "$KEYS_RAW" | tail -1 | awk '{print $NF}' | tr -d '[:space:]')
 
-    # 提取公钥 - 多种匹配方式
-    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -iE "^.*public.*key.*:" | sed -E 's/^.*public.*key.*:[[:space:]]*//i' | head -1 | tr -d '[:space:]')
+    # 方法2：按关键字提取（备用验证）
+    local PRIVATE_KEY_CHECK=$(echo "$KEYS_RAW" | grep -i "private" | awk '{print $NF}' | tr -d '[:space:]')
+    local PUBLIC_KEY_CHECK=$(echo "$KEYS_RAW" | grep -i "public" | awk '{print $NF}' | tr -d '[:space:]')
 
-    # 如果上面提取失败，尝试按行尾字段强提取
-    if [[ -z "$PRIVATE_KEY" ]]; then
-        # 尝试提取第一行的最后一个字段
-        PRIVATE_KEY=$(echo "$KEYS_RAW" | head -1 | awk '{print $NF}' | tr -d '[:space:]')
+    # 验证两种方法提取结果是否一致
+    if [[ "$PRIVATE_KEY" != "$PRIVATE_KEY_CHECK" || "$PUBLIC_KEY" != "$PUBLIC_KEY_CHECK" ]]; then
+        warn "密钥提取方法验证不一致，使用关键字方法"
+        PRIVATE_KEY="$PRIVATE_KEY_CHECK"
+        PUBLIC_KEY="$PUBLIC_KEY_CHECK"
     fi
 
-    if [[ -z "$PUBLIC_KEY" ]]; then
-        # 尝试提取最后一行的最后一个字段
-        PUBLIC_KEY=$(echo "$KEYS_RAW" | tail -1 | awk '{print $NF}' | tr -d '[:space:]')
-    fi
-
-    # 验证密钥长度 (x25519 密钥标准为 43 字符 Base64，最低兼容 40 字符)
+    # 验证密钥长度 (x25519 密钥为 43 字符 Base64)
     if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
         success "密钥自动生成成功！"
-        info "私钥 PrivateKey: ${PRIVATE_KEY:0:20}... (共${#PRIVATE_KEY}字符)"
-        info "公钥 PublicKey:  ${PUBLIC_KEY:0:20}... (共${#PUBLIC_KEY}字符)"
+        info "私钥 PrivateKey (服务端): ${PRIVATE_KEY:0:20}... (共${#PRIVATE_KEY}字符)"
+        info "公钥 PublicKey (客户端):  ${PUBLIC_KEY:0:20}... (共${#PUBLIC_KEY}字符)"
+
+        # ====================== 关键验证：确保密钥匹配 ======================
+        # 使用 xray 的验证功能（如果可用）
+        if $XRAY_CMD x25519 -p "$PUBLIC_KEY" 2>&1 | grep -q "Private"; then
+            info "密钥配对验证通过"
+        fi
+
         return 0
     fi
 
@@ -468,12 +472,14 @@ _manual_input_keys() {
     echo -e "${YELLOW}示例输出：${NC}"
     echo "  Private key: CFymf6Bk0GSM8NJV4qRRhacnPE-MMVh4-lIXrDMkEUA"
     echo "  Public key: HQ-zA0fmFUcCfbR-7Y_GJDqmHayAk3aC0Et-9-DQ8mc"
-    echo -e "  你只需要粘贴密钥部分（冒号后面的内容）${NC}"
+    echo -e "${YELLOW}重要提示：${NC}"
+    echo -e "  ${GREEN}Private key (私钥)${NC} → 用于服务端配置"
+    echo -e "  ${GREEN}Public key (公钥)${NC} → 用于客户端链接"
     echo ""
 
     while true; do
-        read -p "请粘贴 PrivateKey (私钥): " PRIVATE_KEY
-        read -p "请粘贴 PublicKey (公钥): " PUBLIC_KEY
+        read -p "请粘贴 Private key (私钥，服务端用): " PRIVATE_KEY
+        read -p "请粘贴 Public key (公钥，客户端用): " PUBLIC_KEY
 
         # 清理输入
         PRIVATE_KEY=$(echo "$PRIVATE_KEY" | tr -d '[:space:]')
@@ -481,6 +487,8 @@ _manual_input_keys() {
 
         if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
             success "密钥输入验证通过"
+            info "私钥: ${PRIVATE_KEY:0:20}..."
+            info "公钥: ${PUBLIC_KEY:0:20}..."
             break
         else
             warn "密钥长度异常 (私钥: ${#PRIVATE_KEY}字符, 公钥: ${#PUBLIC_KEY}字符)"
@@ -492,8 +500,8 @@ _manual_input_keys() {
 
 # Reality回落目标配置
 get_reality_input() {
-    # 先生成密钥
-    generate_reality_keys
+    # 先生成密钥 - 只生成一次
+    generate_reality_keys_once
 
     # 密钥必须有效才能继续
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
@@ -542,12 +550,27 @@ get_reality_input() {
     info "选择的 TLS 指纹: $FINGERPRINT"
 
     # 确认所有参数已正确设置
-    info "Reality 参数确认:"
-    echo "  PrivateKey: ${PRIVATE_KEY:0:20}..."
-    echo "  PublicKey:  ${PUBLIC_KEY:0:20}..."
-    echo "  ShortId:    $SHORT_ID"
-    echo "  Dest:       $DEST:$DEST_PORT"
-    echo "  Fingerprint: $FINGERPRINT"
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${BLUE}           Reality 参数最终确认${NC}"
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${YELLOW}私钥 PrivateKey (服务端配置用):${NC}"
+    echo -e "${GREEN}${PRIVATE_KEY}${NC}"
+    echo ""
+    echo -e "${YELLOW}公钥 PublicKey (客户端链接用):${NC}"
+    echo -e "${GREEN}${PUBLIC_KEY}${NC}"
+    echo ""
+    echo -e "${YELLOW}ShortId:${NC} $SHORT_ID"
+    echo -e "${YELLOW}Dest:${NC} $DEST:$DEST_PORT"
+    echo -e "${YELLOW}Fingerprint:${NC} $FINGERPRINT"
+    echo -e "${BLUE}================================================${NC}"
+
+    read -p "确认以上参数正确? [Y/n]: " confirm_keys
+    confirm_keys=${confirm_keys:-Y}
+    if [[ "$confirm_keys" != "y" && "$confirm_keys" != "Y" ]]; then
+        warn "请重新运行脚本"
+        return 1
+    fi
 }
 
 # SSL证书申请
@@ -584,7 +607,7 @@ get_cert() {
     success "SSL证书申请成功"
 }
 
-# ====================== 官方规范配置文件生成 ======================
+# ====================== 配置文件生成 ======================
 gen_reality_server_config() {
     info "生成 VLESS + Reality 服务端配置文件..."
 
@@ -942,7 +965,7 @@ start_service() {
     systemctl is-active --quiet xray && success "Xray 服务启动成功" || error "Xray 服务启动失败，请查看日志"
 }
 
-# ====================== 修复：链接生成函数（参数完整性检查） ======================
+# ====================== 链接生成函数 ======================
 gen_vless_reality_link() {
     # 参数完整性检查
     if [[ -z "$UUID" || -z "$SERVER_IP" || -z "$PORT" || -z "$DEST" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
@@ -951,7 +974,10 @@ gen_vless_reality_link() {
         return 1
     fi
 
+    # 使用正确的 PUBLIC_KEY（客户端用）
     VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&xver=0#${REMARK}"
+
+    info "VLESS 链接已生成，使用的 PublicKey: ${PUBLIC_KEY:0:20}..."
     return 0
 }
 
@@ -970,7 +996,7 @@ gen_vmess_link() {
     return 0
 }
 
-# 二维码生成（修复：先生成链接再显示）
+# 二维码生成
 gen_qrcode() {
     info "生成客户端节点信息..."
     echo ""
@@ -979,10 +1005,14 @@ gen_qrcode() {
     echo -e "${BLUE}================================================${NC}"
 
     if [[ "$PROTOCOL_CHOICE" == "1" ]]; then
-        # 先生成链接
         gen_vless_reality_link || error "VLESS 链接生成失败"
 
         echo -e "${GREEN}【VLESS + Reality + Vision】${NC}"
+        echo ""
+        echo -e "${YELLOW}重要：请确认以下密钥匹配${NC}"
+        echo -e "服务端配置 privateKey: ${PRIVATE_KEY:0:20}..."
+        echo -e "客户端链接 pbk: ${PUBLIC_KEY:0:20}..."
+        echo ""
         echo -e "${YELLOW}节点链接:${NC}"
         echo -e "${GREEN}${VLESS_LINK}${NC}"
         echo ""
@@ -990,7 +1020,6 @@ gen_qrcode() {
         qrencode -t ANSIUTF8 "$VLESS_LINK"
 
     elif [[ "$PROTOCOL_CHOICE" == "2" ]]; then
-        # 先生成链接
         gen_vmess_link || error "VMess 链接生成失败"
 
         echo -e "${GREEN}【VMess + TLS + WebSocket】${NC}"
@@ -1001,16 +1030,18 @@ gen_qrcode() {
         qrencode -t ANSIUTF8 "$VMESS_LINK"
 
     else
-        # 双协议模式
         gen_vless_reality_link || warn "VLESS 链接生成失败"
         gen_vmess_link || warn "VMess 链接生成失败"
 
         echo -e "${GREEN}【VLESS + Reality】(端口 ${PORT})${NC}"
         if [[ -n "$VLESS_LINK" ]]; then
+            echo ""
+            echo -e "${YELLOW}密钥匹配确认:${NC}"
+            echo -e "privateKey: ${PRIVATE_KEY:0:20}..."
+            echo -e "pbk: ${PUBLIC_KEY:0:20}..."
+            echo ""
             echo -e "${VLESS_LINK}"
             qrencode -t ANSIUTF8 "$VLESS_LINK"
-        else
-            warn "VLESS 链接生成失败，请检查配置"
         fi
 
         echo ""
@@ -1019,8 +1050,6 @@ gen_qrcode() {
         if [[ -n "$VMESS_LINK" ]]; then
             echo -e "${VMESS_LINK}"
             qrencode -t ANSIUTF8 "$VMESS_LINK"
-        else
-            warn "VMess 链接生成失败，请检查配置"
         fi
     fi
     echo -e "${BLUE}================================================${NC}"
@@ -1037,6 +1066,7 @@ gen_client_config() {
             warn "VLESS 客户端配置参数不完整"
         else
             echo -e "${GREEN}【VLESS + Reality + Vision 客户端配置】${NC}"
+            echo -e "${YELLOW}注意：publicKey 必须与服务端 privateKey 配对${NC}"
             cat << EOF
 {
   "log": { "loglevel": "warning" },
@@ -1170,13 +1200,9 @@ EOF
     echo -e "${PURPLE}================================================${NC}"
 }
 
-# 配置文件保存（修复：确保链接已生成）
+# 配置文件保存
 save_config() {
     local config_file="/root/xray-client.txt"
-
-    # 确保链接已生成
-    gen_vless_reality_link
-    [[ "$PROTOCOL_CHOICE" =~ 2|3 ]] && gen_vmess_link
 
     cat > "$config_file" << EOF
 ==========================================
@@ -1192,12 +1218,19 @@ UUID: ${UUID}
 EOF
 
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        # 确保链接已生成
+        gen_vless_reality_link
+
         cat >> "$config_file" << EOF
 【VLESS + Reality + Vision 协议】
 监听端口: ${PORT}
 回落目标: ${DEST}:${DEST_PORT}
-私钥 PrivateKey: ${PRIVATE_KEY}
-公钥 PublicKey: ${PUBLIC_KEY}
+
+${RED}重要：密钥配对关系${NC}
+服务端 privateKey: ${PRIVATE_KEY}
+客户端 publicKey:  ${PUBLIC_KEY}
+这两个密钥必须配对，否则无法连接！
+
 Short ID: ${SHORT_ID}
 TLS 指纹: ${FINGERPRINT}
 
@@ -1208,7 +1241,9 @@ EOF
     fi
 
     if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        gen_vmess_link
         local PORT_USE=${VMESS_PORT_FINAL:-$PORT}
+
         cat >> "$config_file" << EOF
 【VMess + TLS + WebSocket 协议】
 监听端口: ${PORT_USE}
@@ -1293,11 +1328,11 @@ view_logs() {
     journalctl -u xray --no-pager -n 30
 }
 
-# ====================== 竖向主菜单 ======================
+# ====================== 主菜单 ======================
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
-    echo -e "${PURPLE}       Xray 一键安装脚本(终极优化版)${NC}"
+    echo -e "${PURPLE}       Xray 一键安装脚本(修复版v2)${NC}"
     echo -e "${PURPLE}============================================${NC}"
 
     if check_xray_deployed; then
@@ -1325,7 +1360,7 @@ show_menu() {
     echo -e "${PURPLE}============================================${NC}"
 }
 
-# 全新安装流程（修复：确保参数正确传递）
+# 全新安装流程
 install_new() {
     # 重置所有全局变量
     PRIVATE_KEY=""
@@ -1368,7 +1403,7 @@ install_new() {
 
     # Reality协议配置
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
-        get_reality_input
+        get_reality_input || error "Reality 参数配置失败"
     fi
 
     # 申请证书

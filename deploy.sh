@@ -414,16 +414,16 @@ generate_reality_keys_once() {
         return 0
     fi
 
-    # 打印原始输出
+    # 打印原始输出以便调试
     info "Xray 密钥生成原始输出:"
     echo "$KEYS_RAW"
 
-    # ====================== 使用关键字方法提取（适配三行格式）======================
-    # PrivateKey：提取包含 "PrivateKey" 或 "Private key" 的行
-    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -iE "PrivateKey|Private key" | sed -E 's/.*:[[:space:]]*//' | head -1 | tr -d '[:space:]')
-
-    # PublicKey：提取包含 "PublicKey" 或 "Public key" 的行（注意：新格式是 Password (PublicKey)）
-    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -iE "PublicKey|Public key" | sed -E 's/.*:[[:space:]]*//' | head -1 | tr -d '[:space:]')
+    # ====================== 优化后的密钥提取逻辑 ======================
+    # 提取 PrivateKey：匹配包含 "Private" 的行，取冒号后内容
+    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -i "Private" | head -1 | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
+    
+    # 提取 PublicKey：匹配包含 "Public" 或 "Password" 的行，取冒号后内容
+    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -iE "Public|Password" | head -1 | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
 
     # 验证密钥长度 (x25519 密钥为 43 字符 Base64)
     if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
@@ -471,7 +471,7 @@ _manual_input_keys() {
     done
 }
 
-# Reality回落目标配置
+# Reality回落目标配置 (统一入口)
 get_reality_input() {
     # 先生成密钥
     generate_reality_keys_once
@@ -517,6 +517,18 @@ get_reality_input() {
     read -p "请选择 [默认 1]: " FP_CHOICE
     FP_CHOICE=${FP_CHOICE:-1}
     FINGERPRINT=$([[ "$FP_CHOICE" == "1" ]] && echo "chrome" || echo "firefox")
+    
+    # 增加确认步骤
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${BLUE}           密钥配对确认（请务必核对）${NC}"
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${YELLOW}服务端 privateKey:${NC} ${PRIVATE_KEY}"
+    echo -e "${YELLOW}客户端 publicKey:${NC}  ${PUBLIC_KEY}"
+    echo -e "${BLUE}================================================${NC}"
+    read -p "确认密钥配对正确? [Y/n]: " confirm
+    confirm=${confirm:-Y}
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && error "请重新运行脚本"
 }
 
 # SSL证书申请
@@ -647,7 +659,7 @@ gen_reality_server_config() {
 EOF
 
     success "服务端配置生成完成"
-    info "确认: privateKey = ${PRIVATE_KEY}"
+    info "确认配置文件内 privateKey = ${PRIVATE_KEY}"
 }
 
 gen_vmess_server_config() {
@@ -916,7 +928,7 @@ gen_vless_reality_link() {
     fi
 
     VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&xver=0#${REMARK}"
-    info "确认: pbk = ${PUBLIC_KEY}"
+    info "确认链接内 pbk = ${PUBLIC_KEY}"
     return 0
 }
 
@@ -1261,7 +1273,7 @@ view_logs() {
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
-    echo -e "${PURPLE}       Xray 一键安装脚本(修复版v3)${NC}"
+    echo -e "${PURPLE}       Xray 一键安装脚本(修复版v4)${NC}"
     echo -e "${PURPLE}============================================${NC}"
 
     if check_xray_deployed; then
@@ -1289,7 +1301,7 @@ show_menu() {
     echo -e "${PURPLE}============================================${NC}"
 }
 
-# ====================== 全新安装流程（紧凑流程，和重新部署一致）======================
+# ====================== 修复后的全新安装流程（复用函数，逻辑统一）======================
 install_new() {
     # 重置所有全局变量
     PRIVATE_KEY=""
@@ -1312,8 +1324,11 @@ install_new() {
     install_xray
     select_protocol
 
-    # ====================== 关键：紧凑流程，密钥只生成一次 ======================
-    # 步骤1: 先获取用户输入参数
+    # 1. 先获取服务器IP
+    SERVER_IP=$(curl -s4 ip.sb || curl -s6 ip.sb)
+    info "服务器公网IP: $SERVER_IP"
+
+    # 2. 基础参数设置
     read -p "请输入监听端口 [默认443]: " PORT
     PORT=${PORT:-443}
     read -p "请输入节点备注名称 [默认xray]: " REMARK
@@ -1321,7 +1336,7 @@ install_new() {
     UUID=$(xray uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
     info "生成的 UUID: $UUID"
 
-    # 步骤2: VMess需要域名
+    # 3. VMess需要域名
     if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
         read -p "请输入域名 (VMess必须): " DOMAIN
         [[ -z "$DOMAIN" ]] && error "VMess 协议必须提供域名"
@@ -1329,90 +1344,32 @@ install_new() {
         DOMAIN=""
     fi
 
-    # 步骤3: Reality协议 - 密钥只生成一次，立即使用
+    # 4. Reality协议 - 直接调用 get_reality_input (和重新部署保持一致)
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
-        # 生成密钥（只一次）
-        generate_reality_keys_once
-
-        if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-            error "密钥生成失败"
-        fi
-
-        # 立即生成 SHORT_ID
-        SHORT_ID=$(openssl rand -hex 8)
-        info "生成 Short ID: $SHORT_ID"
-
-        # 选择回落目标
-        echo ""
-        echo -e "${PURPLE}请选择 Reality 回落目标${NC}"
-        echo -e "  ${GREEN}1${NC}. www.microsoft.com"
-        echo -e "  ${GREEN}2${NC}. dl.google.com"
-        echo -e "  ${GREEN}3${NC}. www.apple.com"
-        echo -e "  ${GREEN}4${NC}. www.amazon.com"
-        echo -e "  ${GREEN}5${NC}. 自定义"
-        read -p "请选择 [默认 1]: " DEST_CHOICE
-        DEST_CHOICE=${DEST_CHOICE:-1}
-
-        case $DEST_CHOICE in
-            1) DEST="www.microsoft.com" ;;
-            2) DEST="dl.google.com" ;;
-            3) DEST="www.apple.com" ;;
-            4) DEST="www.amazon.com" ;;
-            5)
-                read -p "请输入域名: " DEST
-                [[ -z "$DEST" ]] && error "域名不能为空"
-                ;;
-            *) DEST="www.microsoft.com" ;;
-        esac
-        DEST_PORT=443
-
-        # TLS指纹
-        echo ""
-        echo -e "${PURPLE}请选择 TLS 指纹${NC}"
-        echo -e "  ${GREEN}1${NC}. chrome"
-        echo -e "  ${GREEN}2${NC}. firefox"
-        read -p "请选择 [默认 1]: " FP_CHOICE
-        FP_CHOICE=${FP_CHOICE:-1}
-        FINGERPRINT=$([[ "$FP_CHOICE" == "1" ]] && echo "chrome" || echo "firefox")
-
-        # 显示密钥配对确认
-        echo ""
-        echo -e "${BLUE}================================================${NC}"
-        echo -e "${BLUE}           密钥配对确认（请务必核对）${NC}"
-        echo -e "${BLUE}================================================${NC}"
-        echo -e "${YELLOW}服务端 privateKey:${NC} ${PRIVATE_KEY}"
-        echo -e "${YELLOW}客户端 publicKey:${NC}  ${PUBLIC_KEY}"
-        echo -e "${BLUE}================================================${NC}"
-        read -p "确认密钥配对正确? [Y/n]: " confirm
-        confirm=${confirm:-Y}
-        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && error "请重新运行"
+        get_reality_input
     fi
 
-    # 步骤4: 获取服务器IP（在密钥生成后）
-    SERVER_IP=$(curl -s4 ip.sb || curl -s6 ip.sb)
-    info "服务器公网IP: $SERVER_IP"
-
-    # 步骤5: 申请证书
+    # 5. 申请证书
     get_cert
 
-    # 步骤6: 生成配置
+    # 6. 生成配置
     case $PROTOCOL_CHOICE in
         1) gen_reality_server_config ;;
         2) gen_vmess_server_config ;;
         3) gen_dual_server_config ;;
     esac
 
-    # 步骤7: 创建服务并启动
+    # 7. 创建服务并启动
     create_systemd_service
     start_service
     setup_cert_renewal
 
-    # 步骤8: 显示节点信息
+    # 8. 显示节点信息
     gen_qrcode
     gen_client_config
     save_config
 
-    # 步骤9: 开启BBR
+    # 9. 开启BBR
     read -p "是否开启 BBR 加速? [Y/n]: " enable_bbr_choice
     enable_bbr_choice=${enable_bbr_choice:-Y}
     [[ "$enable_bbr_choice" == "y" || "$enable_bbr_choice" == "Y" ]] && enable_bbr

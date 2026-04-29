@@ -280,6 +280,7 @@ redeploy_common() {
     read -p "请输入节点备注名称 [默认xray]: " REMARK
     REMARK=${REMARK:-"xray"}
 
+    # VMess/双协议需要域名
     if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
         read -p "请输入你的域名 (VMess 协议必须): " DOMAIN
         [[ -z "$DOMAIN" ]] && error "VMess 协议必须提供域名"
@@ -287,12 +288,15 @@ redeploy_common() {
         DOMAIN=""
     fi
 
+    # Reality协议需要配置回落目标
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
         get_reality_input
     fi
 
+    # 申请SSL证书
     get_cert
 
+    # 生成对应配置
     case $PROTOCOL_CHOICE in
         1) gen_reality_server_config ;;
         2) gen_vmess_server_config ;;
@@ -378,13 +382,15 @@ select_protocol() {
     PROTOCOL_CHOICE=${PROTOCOL_CHOICE:-1}
 }
 
-# ====================== 已修复：Reality 密钥生成（完美兼容新版Xray）======================
+# ====================== 核心密钥生成函数（只执行一次）======================
 generate_reality_keys_once() {
     info "开始生成 Reality 密钥对..."
 
+    # 重置变量
     PRIVATE_KEY=""
     PUBLIC_KEY=""
 
+    # 查找 xray 命令路径
     local XRAY_CMD=""
     if command -v xray &> /dev/null; then
         XRAY_CMD="xray"
@@ -398,72 +404,96 @@ generate_reality_keys_once() {
         return 0
     fi
 
+    # 执行密钥生成 - 只执行一次！
     local KEYS_RAW=$($XRAY_CMD x25519 2>&1)
     local exit_code=$?
 
     if [[ $exit_code -ne 0 || -z "$KEYS_RAW" ]]; then
-        warn "Xray 命令执行失败"
+        warn "Xray 命令执行失败，错误信息: $KEYS_RAW"
         _manual_input_keys
         return 0
     fi
 
-    # 修复点：严格匹配 Xray 官方输出
-    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -i "PrivateKey:" | awk -F': ' '{print $2}' | tr -d '[:space:]')
-    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -i "Password (PublicKey):" | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    # 打印原始输出
+    info "Xray 密钥生成原始输出:"
+    echo "$KEYS_RAW"
 
+    # ====================== 使用关键字方法提取（适配三行格式）======================
+    # PrivateKey：提取包含 "PrivateKey" 或 "Private key" 的行
+    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -iE "PrivateKey|Private key" | sed -E 's/.*:[[:space:]]*//' | head -1 | tr -d '[:space:]')
+
+    # PublicKey：提取包含 "PublicKey" 或 "Public key" 的行（注意：新格式是 Password (PublicKey)）
+    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -iE "PublicKey|Public key" | sed -E 's/.*:[[:space:]]*//' | head -1 | tr -d '[:space:]')
+
+    # 验证密钥长度 (x25519 密钥为 43 字符 Base64)
     if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
-        success "Reality 密钥自动生成成功！"
+        success "密钥自动生成成功！"
+        info "私钥 PrivateKey: ${PRIVATE_KEY}"
+        info "公钥 PublicKey:  ${PUBLIC_KEY}"
         return 0
     fi
 
-    warn "自动提取失败，切换手动模式"
+    # 自动提取失败，进入手动输入
+    warn "自动提取密钥失败"
     _manual_input_keys
 }
 
-# 手动输入密钥
+# 手动输入密钥兜底函数
 _manual_input_keys() {
     echo ""
-    echo -e "${YELLOW}手动输入密钥：${NC}"
-    echo "执行: xray x25519"
-    echo "PrivateKey: 填私钥"
-    echo "Password (PublicKey): 填公钥"
+    echo -e "${YELLOW}手动输入密钥操作指南：${NC}"
+    echo "1. 新开终端窗口，执行命令: ${GREEN}xray x25519${NC}"
+    echo "2. 复制对应的值，只粘贴冒号后面的密钥内容"
+    echo ""
+    echo -e "${YELLOW}xray 新版本输出格式（三行）：${NC}"
+    echo "  PrivateKey: xxxxx"
+    echo "  Password (PublicKey): yyyyy"
+    echo "  Hash32: zzzzz"
+    echo ""
+    echo -e "${RED}注意：PublicKey 在第二行，不是最后一行 Hash32！${NC}"
     echo ""
 
     while true; do
-        read -p "请输入 PrivateKey: " PRIVATE_KEY
-        read -p "请输入 PublicKey: " PUBLIC_KEY
+        read -p "请粘贴 PrivateKey (私钥): " PRIVATE_KEY
+        read -p "请粘贴 PublicKey (公钥): " PUBLIC_KEY
 
         PRIVATE_KEY=$(echo "$PRIVATE_KEY" | tr -d '[:space:]')
         PUBLIC_KEY=$(echo "$PUBLIC_KEY" | tr -d '[:space:]')
 
-        if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]]; then
-            success "密钥验证通过"
+        if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
+            success "密钥输入验证通过"
             break
         else
-            warn "输入不能为空"
+            warn "密钥长度异常"
+            read -p "是否确认使用? [y/N]: " confirm
+            [[ "$confirm" == "y" || "$confirm" == "Y" ]] && break
         fi
     done
 }
 
-# Reality配置
+# Reality回落目标配置
 get_reality_input() {
+    # 先生成密钥
     generate_reality_keys_once
 
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-        error "Reality 密钥生成失败"
+        error "Reality 密钥生成失败，无法继续配置"
     fi
 
+    # 生成Short ID
     SHORT_ID=$(openssl rand -hex 8)
-    info "生成 Short ID: $SHORT_ID"
+    info "生成的 Short ID: $SHORT_ID"
 
+    # 选择回落目标
     echo ""
-    echo -e "${PURPLE}选择 Reality 回落目标${NC}"
-    echo "1. www.microsoft.com"
-    echo "2. dl.google.com"
-    echo "3. www.apple.com"
-    echo "4. www.amazon.com"
-    echo "5. 自定义"
-    read -p "请选择 [默认1]: " DEST_CHOICE
+    echo -e "${PURPLE}请选择 Reality 回落目标 (DEST)${NC}"
+    echo -e "  ${GREEN}1${NC}. www.microsoft.com (官方首选)"
+    echo -e "  ${GREEN}2${NC}. dl.google.com"
+    echo -e "  ${GREEN}3${NC}. www.apple.com"
+    echo -e "  ${GREEN}4${NC}. www.amazon.com"
+    echo -e "  ${GREEN}5${NC}. 自定义"
+    echo -e "${PURPLE}============================================${NC}"
+    read -p "请选择 [默认 1]: " DEST_CHOICE
     DEST_CHOICE=${DEST_CHOICE:-1}
 
     case $DEST_CHOICE in
@@ -471,39 +501,63 @@ get_reality_input() {
         2) DEST="dl.google.com" ;;
         3) DEST="www.apple.com" ;;
         4) DEST="www.amazon.com" ;;
-        5) read -p "输入域名: " DEST ;;
+        5)
+            read -p "请输入回落目标域名: " DEST
+            [[ -z "$DEST" ]] && error "回落域名不能为空"
+            ;;
         *) DEST="www.microsoft.com" ;;
     esac
     DEST_PORT=443
 
+    # TLS指纹选择
     echo ""
-    echo "TLS 指纹：1.chrome 2.firefox"
-    read -p "选择 [默认1]: " FP_CHOICE
+    echo -e "${PURPLE}请选择 TLS 指纹${NC}"
+    echo -e "  ${GREEN}1${NC}. chrome (推荐)"
+    echo -e "  ${GREEN}2${NC}. firefox"
+    read -p "请选择 [默认 1]: " FP_CHOICE
     FP_CHOICE=${FP_CHOICE:-1}
     FINGERPRINT=$([[ "$FP_CHOICE" == "1" ]] && echo "chrome" || echo "firefox")
 }
 
-# SSL证书
+# SSL证书申请
 get_cert() {
     if [[ "$PROTOCOL_CHOICE" == "1" ]]; then
+        info "VLESS + Reality 协议无需申请SSL证书"
         return
     fi
 
     [[ -z "$DOMAIN" ]] && error "域名不能为空"
 
     if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
-        warn "证书已存在"
+        warn "证书已存在，跳过申请"
         return
     fi
 
+    info "开始申请SSL证书..."
+    local DOMAIN_IP=$(dig +short "$DOMAIN" | tail -1)
+    SERVER_IP=$(curl -s4 ip.sb)
+    if [[ "$DOMAIN_IP" != "$SERVER_IP" ]]; then
+        warn "域名解析IP与服务器IP不匹配"
+        read -p "是否继续申请? [y/N]: " confirm
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && error "请先将域名解析到服务器IP"
+    fi
+
     systemctl stop nginx apache2 caddy 2>/dev/null
-    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --email "admin@$DOMAIN" --key-type ecdsa || error "证书申请失败"
-    success "证书申请成功"
+    certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --email "admin@$DOMAIN" --key-type ecdsa || {
+        error "SSL证书申请失败"
+    }
+    success "SSL证书申请成功"
 }
 
-# ====================== 配置生成 ======================
+# ====================== 配置文件生成 ======================
 gen_reality_server_config() {
-    info "生成 VLESS + Reality 配置..."
+    info "生成 VLESS + Reality 服务端配置..."
+
+    if [[ -z "$UUID" || -z "$PORT" || -z "$PRIVATE_KEY" || -z "$SHORT_ID" || -z "$DEST" ]]; then
+        error "配置参数不完整"
+    fi
+
+    mkdir -p /usr/local/etc/xray
 
     cat > /usr/local/etc/xray/config.json << EOF
 {
@@ -591,10 +645,19 @@ gen_reality_server_config() {
   }
 }
 EOF
+
+    success "服务端配置生成完成"
+    info "确认: privateKey = ${PRIVATE_KEY}"
 }
 
 gen_vmess_server_config() {
-    info "生成 VMess 配置..."
+    info "生成 VMess + TLS + WebSocket 服务端配置..."
+
+    if [[ -z "$UUID" || -z "$PORT" || -z "$DOMAIN" ]]; then
+        error "配置参数不完整"
+    fi
+
+    mkdir -p /usr/local/etc/xray
 
     cat > /usr/local/etc/xray/config.json << EOF
 {
@@ -682,10 +745,18 @@ gen_vmess_server_config() {
   }
 }
 EOF
+
+    success "服务端配置生成完成"
 }
 
 gen_dual_server_config() {
     info "生成双协议配置..."
+
+    if [[ -z "$UUID" || -z "$PORT" || -z "$PRIVATE_KEY" || -z "$SHORT_ID" || -z "$DEST" || -z "$DOMAIN" ]]; then
+        error "配置参数不完整"
+    fi
+
+    mkdir -p /usr/local/etc/xray
     local VMESS_PORT=$((PORT + 1))
     VMESS_PORT_FINAL=$VMESS_PORT
 
@@ -799,10 +870,13 @@ gen_dual_server_config() {
   }
 }
 EOF
+
+    success "服务端配置生成完成"
 }
 
-# Systemd
+# Systemd服务创建
 create_systemd_service() {
+    info "创建 Xray Systemd 服务..."
     cat > /etc/systemd/system/xray.service << EOF
 [Unit]
 Description=Xray Service
@@ -823,71 +897,148 @@ EOF
     systemctl daemon-reload
 }
 
+# 服务启动
 start_service() {
-    xray run -test -config /usr/local/etc/xray/config.json > /dev/null 2>&1 || error "配置无效"
+    info "验证配置文件..."
+    xray run -test -config /usr/local/etc/xray/config.json > /dev/null 2>&1 || error "配置文件无效"
+
+    info "启动 Xray 服务..."
     systemctl enable --now xray && sleep 2
-    systemctl is-active --quiet xray || error "启动失败"
+    systemctl is-active --quiet xray && success "Xray 服务启动成功" || error "Xray 服务启动失败"
 }
 
-# 链接生成
+# ====================== 链接生成（不重复调用密钥生成）======================
 gen_vless_reality_link() {
+    if [[ -z "$UUID" || -z "$SERVER_IP" || -z "$PORT" || -z "$DEST" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
+        warn "VLESS 链接参数不完整"
+        VLESS_LINK=""
+        return 1
+    fi
+
     VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DEST}&fp=${FINGERPRINT}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&xver=0#${REMARK}"
+    info "确认: pbk = ${PUBLIC_KEY}"
+    return 0
 }
 
 gen_vmess_link() {
     local PORT_USE=${VMESS_PORT_FINAL:-$PORT}
+
+    if [[ -z "$UUID" || -z "$DOMAIN" || -z "$PORT_USE" ]]; then
+        warn "VMess 链接参数不完整"
+        VMESS_LINK=""
+        return 1
+    fi
+
     local vmess_json="{\"v\":\"2\",\"ps\":\"${REMARK}-VMess\",\"add\":\"${DOMAIN}\",\"port\":\"${PORT_USE}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"host\":\"${DOMAIN}\",\"path\":\"/vmess\",\"tls\":\"tls\"}"
     VMESS_LINK="vmess://$(echo -n "$vmess_json" | base64 -w 0)"
+    return 0
 }
 
-# 二维码
+# 二维码生成
 gen_qrcode() {
+    info "生成客户端节点信息..."
     echo ""
     echo -e "${BLUE}================================================${NC}"
-    echo -e "${BLUE}               客户端配置${NC}"
+    echo -e "${BLUE}               客户端节点配置${NC}"
     echo -e "${BLUE}================================================${NC}"
 
     if [[ "$PROTOCOL_CHOICE" == "1" ]]; then
-        gen_vless_reality_link
-        echo -e "${GREEN}VLESS + Reality${NC}"
-        echo -e "${YELLOW}链接：${NC}$VLESS_LINK"
+        gen_vless_reality_link || error "VLESS 链接生成失败"
+
+        echo -e "${GREEN}【VLESS + Reality + Vision】${NC}"
+        echo ""
+        echo -e "${YELLOW}密钥配对确认:${NC}"
+        echo -e "  config.json privateKey: ${PRIVATE_KEY}"
+        echo -e "  链接 pbk: ${PUBLIC_KEY}"
+        echo ""
+        echo -e "${YELLOW}节点链接:${NC}"
+        echo -e "${GREEN}${VLESS_LINK}${NC}"
+        echo ""
+        echo -e "${YELLOW}节点二维码:${NC}"
         qrencode -t ANSIUTF8 "$VLESS_LINK"
+
     elif [[ "$PROTOCOL_CHOICE" == "2" ]]; then
-        gen_vmess_link
-        echo -e "${GREEN}VMess${NC}"
-        echo -e "$VMESS_LINK"
+        gen_vmess_link || error "VMess 链接生成失败"
+
+        echo -e "${GREEN}【VMess + TLS + WebSocket】${NC}"
+        echo -e "${YELLOW}节点链接:${NC}"
+        echo -e "${GREEN}${VMESS_LINK}${NC}"
+        echo ""
         qrencode -t ANSIUTF8 "$VMESS_LINK"
+
     else
-        gen_vless_reality_link
-        gen_vmess_link
-        echo -e "${GREEN}VLESS：${NC}$VLESS_LINK"
-        qrencode -t ANSIUTF8 "$VLESS_LINK"
-        echo -e "${GREEN}VMess：${NC}$VMESS_LINK"
-        qrencode -t ANSIUTF8 "$VMESS_LINK"
+        gen_vless_reality_link || warn "VLESS 链接生成失败"
+        gen_vmess_link || warn "VMess 链接生成失败"
+
+        echo -e "${GREEN}【VLESS + Reality】(端口 ${PORT})${NC}"
+        if [[ -n "$VLESS_LINK" ]]; then
+            echo ""
+            echo -e "${YELLOW}密钥配对确认:${NC}"
+            echo -e "  privateKey: ${PRIVATE_KEY}"
+            echo -e "  pbk: ${PUBLIC_KEY}"
+            echo ""
+            echo -e "${VLESS_LINK}"
+            qrencode -t ANSIUTF8 "$VLESS_LINK"
+        fi
+
+        echo ""
+        echo -e "${BLUE}================================================${NC}"
+        echo -e "${GREEN}【VMess + TLS】(端口 ${VMESS_PORT_FINAL})${NC}"
+        if [[ -n "$VMESS_LINK" ]]; then
+            echo -e "${VMESS_LINK}"
+            qrencode -t ANSIUTF8 "$VMESS_LINK"
+        fi
     fi
+    echo -e "${BLUE}================================================${NC}"
 }
 
-# 客户端配置
+# 客户端JSON配置
 gen_client_config() {
-    echo -e "\n${PURPLE}客户端JSON配置${NC}"
+    echo -e "\n${PURPLE}================================================${NC}"
+    echo -e "${PURPLE}          客户端 JSON 配置${NC}"
+    echo -e "${PURPLE}================================================${NC}"
+
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
-        cat << EOF
+        if [[ -z "$SERVER_IP" || -z "$PORT" || -z "$UUID" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" || -z "$DEST" ]]; then
+            warn "VLESS 客户端配置参数不完整"
+        else
+            echo -e "${GREEN}【VLESS + Reality 客户端配置】${NC}"
+            cat << EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
-    { "tag": "socks-in", "port": 10808, "listen": "::", "protocol": "socks", "settings": { "udp": true } },
-    { "tag": "http-in", "port": 10809, "listen": "::", "protocol": "http" }
+    {
+      "tag": "socks-in",
+      "port": 10808,
+      "listen": "::",
+      "protocol": "socks",
+      "settings": { "udp": true, "auth": "noauth" }
+    },
+    {
+      "tag": "http-in",
+      "port": 10809,
+      "listen": "::",
+      "protocol": "http"
+    }
   ],
   "outbounds": [
     {
       "tag": "proxy",
       "protocol": "vless",
       "settings": {
-        "vnext": [{
-          "address": "${SERVER_IP}",
-          "port": ${PORT},
-          "users": [{ "id": "${UUID}", "flow": "xtls-rprx-vision", "encryption": "none" }]
-        }]
+        "vnext": [
+          {
+            "address": "${SERVER_IP}",
+            "port": ${PORT},
+            "users": [
+              {
+                "id": "${UUID}",
+                "flow": "xtls-rprx-vision",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
       },
       "streamSettings": {
         "network": "tcp",
@@ -901,119 +1052,372 @@ gen_client_config() {
         }
       }
     },
-    { "tag": "direct", "protocol": "freedom" },
-    { "tag": "block", "protocol": "blackhole" }
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
   ]
 }
 EOF
+        fi
     fi
+
+    if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        [[ "$PROTOCOL_CHOICE" == "3" ]] && echo ""
+        local PORT_USE=${VMESS_PORT_FINAL:-$PORT}
+
+        if [[ -z "$DOMAIN" || -z "$PORT_USE" || -z "$UUID" ]]; then
+            warn "VMess 客户端配置参数不完整"
+        else
+            echo -e "${GREEN}【VMess + TLS 客户端配置】${NC}"
+            cat << EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "port": 10808,
+      "listen": "::",
+      "protocol": "socks",
+      "settings": { "udp": true }
+    },
+    {
+      "tag": "http-in",
+      "port": 10809,
+      "listen": "::",
+      "protocol": "http"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${DOMAIN}",
+            "port": ${PORT_USE},
+            "users": [
+              {
+                "id": "${UUID}",
+                "alterId": 0,
+                "security": "auto"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess",
+          "headers": { "Host": "${DOMAIN}" }
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${DOMAIN}",
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ]
+}
+EOF
+        fi
+    fi
+    echo -e "${PURPLE}================================================${NC}"
 }
 
-# 保存配置
+# 配置文件保存（直接使用变量，不重复调用链接生成）
 save_config() {
-    cat > /root/xray-client.txt << EOF
-Xray 配置
-IP: ${SERVER_IP}
-UUID: ${UUID}
-端口: ${PORT}
-PrivateKey: ${PRIVATE_KEY}
-PublicKey: ${PUBLIC_KEY}
-ShortId: ${SHORT_ID}
+    local config_file="/root/xray-client.txt"
 
-VLESS链接：
-${VLESS_LINK}
+    cat > "$config_file" << EOF
+==========================================
+    Xray 节点配置信息
+==========================================
+服务器IP: ${SERVER_IP}
+域名: ${DOMAIN:-无需域名}
+UUID: ${UUID}
+配置时间: $(date "+%Y-%m-%d %H:%M:%S")
+==========================================
+
 EOF
+
+    if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        cat >> "$config_file" << EOF
+【VLESS + Reality + Vision】
+监听端口: ${PORT}
+回落目标: ${DEST}:${DEST_PORT}
+
+${RED}密钥配对关系（必须一致）${NC}
+服务端 privateKey: ${PRIVATE_KEY}
+客户端 publicKey:  ${PUBLIC_KEY}
+
+Short ID: ${SHORT_ID}
+TLS 指纹: ${FINGERPRINT}
+
+节点链接:
+${VLESS_LINK:-生成失败}
+
+EOF
+    fi
+
+    if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        local PORT_USE=${VMESS_PORT_FINAL:-$PORT}
+        cat >> "$config_file" << EOF
+【VMess + TLS + WebSocket】
+监听端口: ${PORT_USE}
+WebSocket路径: /vmess
+
+节点链接:
+${VMESS_LINK:-生成失败}
+
+EOF
+    fi
+
+    local TCP_ALGORITHM=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
+    cat >> "$config_file" << EOF
+【系统状态】
+TCP 拥塞算法: ${TCP_ALGORITHM}
+==========================================
+EOF
+
+    info "配置已保存到: $config_file"
 }
 
 # 证书续期
 setup_cert_renewal() {
-    if [[ "$PROTOCOL_CHOICE" != "1" ]]; then
-        (crontab -l 2>/dev/null | grep -v certbot; echo "0 3 * * * certbot renew --quiet && systemctl restart xray") | crontab -
+    if [[ "$PROTOCOL_CHOICE" == "1" ]]; then
+        info "Reality协议无需证书续期"
+        return
     fi
+
+    info "设置证书自动续期..."
+    (crontab -l 2>/dev/null | grep -v "certbot renew"; echo "0 3 * * * certbot renew --quiet && systemctl restart xray") | crontab -
+    success "证书续期已设置"
 }
 
 # 卸载
 uninstall() {
     echo ""
-    read -p "确认卸载 Xray? [y/N]: " c
-    [[ "$c" != "y" ]] && return
-    systemctl disable --now xray
-    rm -rf /usr/local/bin/xray /usr/local/etc/xray /var/log/xray /etc/systemd/system/xray.service /root/xray-client.txt
+    warn "即将卸载 Xray"
+    read -p "确认卸载? [y/N]: " confirm
+    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 0
+
+    info "开始卸载..."
+    systemctl disable --now xray 2>/dev/null
+    rm -f /etc/systemd/system/xray.service
+    rm -rf /usr/local/bin/xray /usr/local/etc/xray /var/log/xray
+    rm -f /root/xray-client.txt
     systemctl daemon-reload
-    success "卸载完成"
+
+    read -p "是否删除SSL证书? [y/N]: " del_cert
+    [[ "$del_cert" == "y" ]] && rm -rf /etc/letsencrypt/live/$DOMAIN /etc/letsencrypt/archive/$DOMAIN /etc/letsencrypt/renewal/$DOMAIN.conf
+
+    success "Xray 已卸载"
 }
 
+# 辅助功能
 view_config() {
-    [[ -f /root/xray-client.txt ]] && cat /root/xray-client.txt || warn "无配置"
+    if [[ -f "/root/xray-client.txt" ]]; then
+        cat /root/xray-client.txt
+        echo ""
+        read -p "是否显示二维码? [y/N]: " show_qr
+        if [[ "$show_qr" == "y" || "$show_qr" == "Y" ]]; then
+            if grep -q "VLESS" /root/xray-client.txt; then
+                local vless_link=$(grep -A1 "节点链接:" /root/xray-client.txt | tail -1)
+                echo -e "${GREEN}VLESS 二维码:${NC}"
+                qrencode -t ANSIUTF8 "$vless_link"
+            fi
+            if grep -q "VMess" /root/xray-client.txt; then
+                local vmess_link=$(grep -A1 "节点链接:" /root/xray-client.txt | tail -1)
+                echo -e "${GREEN}VMess 二维码:${NC}"
+                qrencode -t ANSIUTF8 "$vmess_link"
+            fi
+        fi
+    else
+        warn "未找到配置文件"
+    fi
 }
 
 view_logs() {
-    journalctl -u xray -n 30
-}
-
-# 全新安装
-install_new() {
-    PRIVATE_KEY=""
-    PUBLIC_KEY=""
-    SHORT_ID=""
-    FINGERPRINT="chrome"
-    DEST=""
-    UUID=$(xray uuid)
-    PORT=443
-    SERVER_IP=$(curl -s4 ip.sb)
-    DOMAIN=""
-    REMARK="xray"
-
-    install_dependencies
-    install_xray
-    select_protocol
-
-    read -p "端口 [443]: " PORT
-    PORT=${PORT:-443}
-    read -p "备注 [xray]: " REMARK
-
-    if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
-        read -p "域名: " DOMAIN
-    fi
-
-    if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
-        get_reality_input
-    fi
-
-    get_cert
-    case $PROTOCOL_CHOICE in
-        1) gen_reality_server_config ;;
-        2) gen_vmess_server_config ;;
-        3) gen_dual_server_config ;;
-    esac
-
-    create_systemd_service
-    start_service
-    setup_cert_renewal
-    gen_qrcode
-    gen_client_config
-    save_config
-
-    read -p "开启 BBR? [Y/n]: " bbr
-    [[ "$bbr" != "n" ]] && enable_bbr
-
-    success "安装完成！"
+    echo ""
+    echo -e "${PURPLE}================================================${NC}"
+    echo -e "${PURPLE}               Xray 运行日志${NC}"
+    echo -e "${PURPLE}================================================${NC}"
+    journalctl -u xray --no-pager -n 30
 }
 
 # 主菜单
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
-    echo -e "            Xray 修复脚本 v3.1${NC}"
+    echo -e "${PURPLE}       Xray 一键安装脚本(修复版v3)${NC}"
     echo -e "${PURPLE}============================================${NC}"
+
     if check_xray_deployed; then
-        echo "1. 重新部署  2. 当前状态  3. 卸载  4. 查看配置"
-        echo "5. 日志     6. 重启      7. BBR开 8. BBR关"
-        echo "9. BBR状态 10. 退出"
+        echo -e "  ${GREEN}1${NC}. 重新部署 Xray"
+        echo -e "  ${GREEN}2${NC}. 查看当前部署信息"
+        echo -e "  ${GREEN}3${NC}. 卸载 Xray"
+        echo -e "  ${GREEN}4${NC}. 查看节点配置信息"
+        echo -e "  ${GREEN}5${NC}. 查看 Xray 运行日志"
+        echo -e "  ${GREEN}6${NC}. 重启 Xray 服务"
+        echo -e "  ${GREEN}7${NC}. 开启 BBR 加速"
+        echo -e "  ${GREEN}8${NC}. 关闭 BBR 加速"
+        echo -e "  ${GREEN}9${NC}. 查看 BBR 状态"
+        echo -e "  ${GREEN}10${NC}. 退出脚本"
     else
-        echo "1. 安装Xray  2. 卸载     3. 查看配置 4. 日志"
-        echo "5. 重启     6. BBR开    7. BBR关    8. BBR状态 9. 退出"
+        echo -e "  ${GREEN}1${NC}. 安装 Xray + 开启 BBR 加速"
+        echo -e "  ${GREEN}2${NC}. 卸载 Xray"
+        echo -e "  ${GREEN}3${NC}. 查看节点配置信息"
+        echo -e "  ${GREEN}4${NC}. 查看 Xray 运行日志"
+        echo -e "  ${GREEN}5${NC}. 重启 Xray 服务"
+        echo -e "  ${GREEN}6${NC}. 开启 BBR 加速"
+        echo -e "  ${GREEN}7${NC}. 关闭 BBR 加速"
+        echo -e "  ${GREEN}8${NC}. 查看 BBR 状态"
+        echo -e "  ${GREEN}9${NC}. 退出脚本"
     fi
+    echo -e "${PURPLE}============================================${NC}"
+}
+
+# ====================== 全新安装流程（紧凑流程，和重新部署一致）======================
+install_new() {
+    # 重置所有全局变量
+    PRIVATE_KEY=""
+    PUBLIC_KEY=""
+    SHORT_ID=""
+    FINGERPRINT="chrome"
+    DEST=""
+    DEST_PORT=443
+    UUID=""
+    PORT=443
+    SERVER_IP=""
+    DOMAIN=""
+    REMARK="xray"
+    PROTOCOL_CHOICE=1
+    VMESS_PORT_FINAL=""
+    VLESS_LINK=""
+    VMESS_LINK=""
+
+    install_dependencies
+    install_xray
+    select_protocol
+
+    # ====================== 关键：紧凑流程，密钥只生成一次 ======================
+    # 步骤1: 先获取用户输入参数
+    read -p "请输入监听端口 [默认443]: " PORT
+    PORT=${PORT:-443}
+    read -p "请输入节点备注名称 [默认xray]: " REMARK
+    REMARK=${REMARK:-"xray"}
+    UUID=$(xray uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    info "生成的 UUID: $UUID"
+
+    # 步骤2: VMess需要域名
+    if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        read -p "请输入域名 (VMess必须): " DOMAIN
+        [[ -z "$DOMAIN" ]] && error "VMess 协议必须提供域名"
+    else
+        DOMAIN=""
+    fi
+
+    # 步骤3: Reality协议 - 密钥只生成一次，立即使用
+    if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
+        # 生成密钥（只一次）
+        generate_reality_keys_once
+
+        if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+            error "密钥生成失败"
+        fi
+
+        # 立即生成 SHORT_ID
+        SHORT_ID=$(openssl rand -hex 8)
+        info "生成 Short ID: $SHORT_ID"
+
+        # 选择回落目标
+        echo ""
+        echo -e "${PURPLE}请选择 Reality 回落目标${NC}"
+        echo -e "  ${GREEN}1${NC}. www.microsoft.com"
+        echo -e "  ${GREEN}2${NC}. dl.google.com"
+        echo -e "  ${GREEN}3${NC}. www.apple.com"
+        echo -e "  ${GREEN}4${NC}. www.amazon.com"
+        echo -e "  ${GREEN}5${NC}. 自定义"
+        read -p "请选择 [默认 1]: " DEST_CHOICE
+        DEST_CHOICE=${DEST_CHOICE:-1}
+
+        case $DEST_CHOICE in
+            1) DEST="www.microsoft.com" ;;
+            2) DEST="dl.google.com" ;;
+            3) DEST="www.apple.com" ;;
+            4) DEST="www.amazon.com" ;;
+            5)
+                read -p "请输入域名: " DEST
+                [[ -z "$DEST" ]] && error "域名不能为空"
+                ;;
+            *) DEST="www.microsoft.com" ;;
+        esac
+        DEST_PORT=443
+
+        # TLS指纹
+        echo ""
+        echo -e "${PURPLE}请选择 TLS 指纹${NC}"
+        echo -e "  ${GREEN}1${NC}. chrome"
+        echo -e "  ${GREEN}2${NC}. firefox"
+        read -p "请选择 [默认 1]: " FP_CHOICE
+        FP_CHOICE=${FP_CHOICE:-1}
+        FINGERPRINT=$([[ "$FP_CHOICE" == "1" ]] && echo "chrome" || echo "firefox")
+
+        # 显示密钥配对确认
+        echo ""
+        echo -e "${BLUE}================================================${NC}"
+        echo -e "${BLUE}           密钥配对确认（请务必核对）${NC}"
+        echo -e "${BLUE}================================================${NC}"
+        echo -e "${YELLOW}服务端 privateKey:${NC} ${PRIVATE_KEY}"
+        echo -e "${YELLOW}客户端 publicKey:${NC}  ${PUBLIC_KEY}"
+        echo -e "${BLUE}================================================${NC}"
+        read -p "确认密钥配对正确? [Y/n]: " confirm
+        confirm=${confirm:-Y}
+        [[ "$confirm" != "y" && "$confirm" != "Y" ]] && error "请重新运行"
+    fi
+
+    # 步骤4: 获取服务器IP（在密钥生成后）
+    SERVER_IP=$(curl -s4 ip.sb || curl -s6 ip.sb)
+    info "服务器公网IP: $SERVER_IP"
+
+    # 步骤5: 申请证书
+    get_cert
+
+    # 步骤6: 生成配置
+    case $PROTOCOL_CHOICE in
+        1) gen_reality_server_config ;;
+        2) gen_vmess_server_config ;;
+        3) gen_dual_server_config ;;
+    esac
+
+    # 步骤7: 创建服务并启动
+    create_systemd_service
+    start_service
+    setup_cert_renewal
+
+    # 步骤8: 显示节点信息
+    gen_qrcode
+    gen_client_config
+    save_config
+
+    # 步骤9: 开启BBR
+    read -p "是否开启 BBR 加速? [Y/n]: " enable_bbr_choice
+    enable_bbr_choice=${enable_bbr_choice:-Y}
+    [[ "$enable_bbr_choice" == "y" || "$enable_bbr_choice" == "Y" ]] && enable_bbr
+
+    success "Xray 安装完成！节点可正常使用"
 }
 
 # 主函数
@@ -1023,7 +1427,9 @@ main() {
 
     while true; do
         show_menu
-        read -p "选项: " choice
+        read -p "请输入选项编号: " choice
+        choice=${choice:-1}
+
         if check_xray_deployed; then
             case $choice in
                 1) redeploy_xray ;;
@@ -1031,7 +1437,10 @@ main() {
                 3) uninstall ;;
                 4) view_config ;;
                 5) view_logs ;;
-                6) systemctl restart xray && success "重启成功" ;;
+                6)
+                    systemctl restart xray && sleep 2
+                    systemctl is-active --quiet xray && success "服务重启成功" || warn "服务重启失败"
+                    ;;
                 7) enable_bbr ;;
                 8) disable_bbr ;;
                 9) view_bbr_status ;;
@@ -1044,6 +1453,7 @@ main() {
                 2) uninstall ;;
                 3) view_config ;;
                 4) view_logs ;;
+                5) warn "Xray 未安装" ;;
                 6) enable_bbr ;;
                 7) disable_bbr ;;
                 8) view_bbr_status ;;
@@ -1054,4 +1464,5 @@ main() {
     done
 }
 
+# 执行主函数
 main

@@ -236,6 +236,7 @@ redeploy_update_keys() {
     DEST_PORT=443
     FINGERPRINT=${OLD_FP:-"chrome"}
 
+    # 自动生成密钥，失败则兜底手动
     generate_reality_keys_once
     SHORT_ID=$(openssl rand -hex 8)
     info "生成的 Short ID: $SHORT_ID"
@@ -382,9 +383,10 @@ select_protocol() {
     PROTOCOL_CHOICE=${PROTOCOL_CHOICE:-1}
 }
 
-# ====================== 核心密钥生成函数（只执行一次）======================
+# ====================== 【修复核心】全自动密钥生成函数 ======================
+# 固定行号提取，同一次命令生成的公私钥100%配对，失败自动调用手动兜底
 generate_reality_keys_once() {
-    info "开始生成 Reality 密钥对..."
+    info "开始全自动生成 Reality 密钥对..."
 
     # 重置变量
     PRIVATE_KEY=""
@@ -404,53 +406,46 @@ generate_reality_keys_once() {
         return 0
     fi
 
-    # 执行密钥生成 - 只执行一次！
-    local KEYS_RAW=$($XRAY_CMD x25519 2>&1)
+    # 执行一次密钥生成，把输出按行存入数组（核心修复：固定行顺序提取）
+    mapfile -t KEYS_LINES < <($XRAY_CMD x25519 2>&1)
     local exit_code=$?
 
-    if [[ $exit_code -ne 0 || -z "$KEYS_RAW" ]]; then
-        warn "Xray 命令执行失败，错误信息: $KEYS_RAW"
+    # 命令执行失败，走手动兜底
+    if [[ $exit_code -ne 0 || ${#KEYS_LINES[@]} -lt 2 ]]; then
+        warn "Xray 密钥生成命令执行失败，错误信息: ${KEYS_LINES[*]}"
         _manual_input_keys
         return 0
     fi
 
-    # 打印原始输出以便调试
-    info "Xray 密钥生成原始输出:"
-    echo "$KEYS_RAW"
+    # 固定行提取：第1行=私钥，第2行=公钥（兼容所有Xray版本，无视关键词）
+    PRIVATE_KEY=$(echo "${KEYS_LINES[0]}" | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
+    PUBLIC_KEY=$(echo "${KEYS_LINES[1]}" | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
 
-    # ====================== 优化后的密钥提取逻辑 ======================
-    # 提取 PrivateKey：匹配包含 "Private" 的行，取冒号后内容
-    PRIVATE_KEY=$(echo "$KEYS_RAW" | grep -i "Private" | head -1 | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
-    
-    # 提取 PublicKey：匹配包含 "Public" 或 "Password" 的行，取冒号后内容
-    PUBLIC_KEY=$(echo "$KEYS_RAW" | grep -iE "Public|Password" | head -1 | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
-
-    # 验证密钥长度 (x25519 密钥为 43 字符 Base64)
-    if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -ge 40 && ${#PUBLIC_KEY} -ge 40 ]]; then
-        success "密钥自动生成成功！"
-        info "私钥 PrivateKey: ${PRIVATE_KEY}"
-        info "公钥 PublicKey:  ${PUBLIC_KEY}"
+    # 密钥合法性校验（x25519密钥固定43位base64）
+    if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -eq 43 && ${#PUBLIC_KEY} -eq 43 ]]; then
+        success "密钥全自动生成成功！"
+        info "服务端 PrivateKey: ${PRIVATE_KEY}"
+        info "客户端 PublicKey:  ${PUBLIC_KEY}"
         return 0
     fi
 
-    # 自动提取失败，进入手动输入
-    warn "自动提取密钥失败"
+    # 校验不通过，走手动兜底
+    warn "自动生成的密钥校验不通过，进入手动输入模式"
     _manual_input_keys
 }
 
-# 手动输入密钥兜底函数
+# 手动输入密钥兜底函数（仅自动生成失败时调用）
 _manual_input_keys() {
     echo ""
     echo -e "${YELLOW}手动输入密钥操作指南：${NC}"
     echo "1. 新开终端窗口，执行命令: ${GREEN}xray x25519${NC}"
     echo "2. 复制对应的值，只粘贴冒号后面的密钥内容"
     echo ""
-    echo -e "${YELLOW}xray 新版本输出格式（三行）：${NC}"
-    echo "  PrivateKey: xxxxx"
-    echo "  Password (PublicKey): yyyyy"
-    echo "  Hash32: zzzzz"
+    echo -e "${YELLOW}xray 输出格式：${NC}"
+    echo "  第1行 PrivateKey: xxxxx  <-- 粘贴到 PrivateKey 输入框"
+    echo "  第2行 PublicKey:  yyyyy  <-- 粘贴到 PublicKey 输入框"
     echo ""
-    echo -e "${RED}注意：PublicKey 在第二行，不是最后一行 Hash32！${NC}"
+    echo -e "${RED}注意：不要复制第3行的 Hash32！${NC}"
     echo ""
 
     while true; do
@@ -464,71 +459,32 @@ _manual_input_keys() {
             success "密钥输入验证通过"
             break
         else
-            warn "密钥长度异常"
+            warn "密钥长度异常，请检查输入是否正确"
             read -p "是否确认使用? [y/N]: " confirm
             [[ "$confirm" == "y" || "$confirm" == "Y" ]] && break
         fi
     done
 }
 
-# Reality回落目标配置 (统一入口)
+# Reality回落目标配置（全自动，无人工确认）
 get_reality_input() {
-    # 先生成密钥
+    # 全自动生成密钥，失败自动调用手动兜底
     generate_reality_keys_once
 
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
         error "Reality 密钥生成失败，无法继续配置"
     fi
 
-    # 生成Short ID
+    # 自动生成Short ID
     SHORT_ID=$(openssl rand -hex 8)
     info "生成的 Short ID: $SHORT_ID"
 
-    # 选择回落目标
-    echo ""
-    echo -e "${PURPLE}请选择 Reality 回落目标 (DEST)${NC}"
-    echo -e "  ${GREEN}1${NC}. www.microsoft.com (官方首选)"
-    echo -e "  ${GREEN}2${NC}. dl.google.com"
-    echo -e "  ${GREEN}3${NC}. www.apple.com"
-    echo -e "  ${GREEN}4${NC}. www.amazon.com"
-    echo -e "  ${GREEN}5${NC}. 自定义"
-    echo -e "${PURPLE}============================================${NC}"
-    read -p "请选择 [默认 1]: " DEST_CHOICE
-    DEST_CHOICE=${DEST_CHOICE:-1}
-
-    case $DEST_CHOICE in
-        1) DEST="www.microsoft.com" ;;
-        2) DEST="dl.google.com" ;;
-        3) DEST="www.apple.com" ;;
-        4) DEST="www.amazon.com" ;;
-        5)
-            read -p "请输入回落目标域名: " DEST
-            [[ -z "$DEST" ]] && error "回落域名不能为空"
-            ;;
-        *) DEST="www.microsoft.com" ;;
-    esac
+    # 默认回落目标，无需手动选择
+    DEST="www.microsoft.com"
     DEST_PORT=443
-
-    # TLS指纹选择
-    echo ""
-    echo -e "${PURPLE}请选择 TLS 指纹${NC}"
-    echo -e "  ${GREEN}1${NC}. chrome (推荐)"
-    echo -e "  ${GREEN}2${NC}. firefox"
-    read -p "请选择 [默认 1]: " FP_CHOICE
-    FP_CHOICE=${FP_CHOICE:-1}
-    FINGERPRINT=$([[ "$FP_CHOICE" == "1" ]] && echo "chrome" || echo "firefox")
-    
-    # 增加确认步骤
-    echo ""
-    echo -e "${BLUE}================================================${NC}"
-    echo -e "${BLUE}           密钥配对确认（请务必核对）${NC}"
-    echo -e "${BLUE}================================================${NC}"
-    echo -e "${YELLOW}服务端 privateKey:${NC} ${PRIVATE_KEY}"
-    echo -e "${YELLOW}客户端 publicKey:${NC}  ${PUBLIC_KEY}"
-    echo -e "${BLUE}================================================${NC}"
-    read -p "确认密钥配对正确? [Y/n]: " confirm
-    confirm=${confirm:-Y}
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && error "请重新运行脚本"
+    FINGERPRINT="chrome"
+    info "回落目标: ${DEST}:${DEST_PORT}"
+    info "TLS指纹: ${FINGERPRINT}"
 }
 
 # SSL证书申请
@@ -919,7 +875,7 @@ start_service() {
     systemctl is-active --quiet xray && success "Xray 服务启动成功" || error "Xray 服务启动失败"
 }
 
-# ====================== 链接生成（不重复调用密钥生成）======================
+# ====================== 链接生成 ======================
 gen_vless_reality_link() {
     if [[ -z "$UUID" || -z "$SERVER_IP" || -z "$PORT" || -z "$DEST" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
         warn "VLESS 链接参数不完整"
@@ -1148,7 +1104,7 @@ EOF
     echo -e "${PURPLE}================================================${NC}"
 }
 
-# 配置文件保存（直接使用变量，不重复调用链接生成）
+# 配置文件保存
 save_config() {
     local config_file="/root/xray-client.txt"
 
@@ -1170,7 +1126,7 @@ EOF
 监听端口: ${PORT}
 回落目标: ${DEST}:${DEST_PORT}
 
-${RED}密钥配对关系（必须一致）${NC}
+密钥配对关系（必须一致）
 服务端 privateKey: ${PRIVATE_KEY}
 客户端 publicKey:  ${PUBLIC_KEY}
 
@@ -1273,7 +1229,7 @@ view_logs() {
 show_menu() {
     echo ""
     echo -e "${PURPLE}============================================${NC}"
-    echo -e "${PURPLE}       Xray 一键安装脚本(修复版v4)${NC}"
+    echo -e "${PURPLE}       Xray 一键安装脚本(全自动修复版)${NC}"
     echo -e "${PURPLE}============================================${NC}"
 
     if check_xray_deployed; then
@@ -1301,7 +1257,7 @@ show_menu() {
     echo -e "${PURPLE}============================================${NC}"
 }
 
-# ====================== 修复后的全新安装流程（复用函数，逻辑统一）======================
+# ====================== 全新安装流程 ======================
 install_new() {
     # 重置所有全局变量
     PRIVATE_KEY=""
@@ -1324,11 +1280,11 @@ install_new() {
     install_xray
     select_protocol
 
-    # 1. 先获取服务器IP
+    # 获取服务器IP
     SERVER_IP=$(curl -s4 ip.sb || curl -s6 ip.sb)
     info "服务器公网IP: $SERVER_IP"
 
-    # 2. 基础参数设置
+    # 基础参数设置
     read -p "请输入监听端口 [默认443]: " PORT
     PORT=${PORT:-443}
     read -p "请输入节点备注名称 [默认xray]: " REMARK
@@ -1336,7 +1292,7 @@ install_new() {
     UUID=$(xray uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
     info "生成的 UUID: $UUID"
 
-    # 3. VMess需要域名
+    # VMess需要域名
     if [[ "$PROTOCOL_CHOICE" == "2" || "$PROTOCOL_CHOICE" == "3" ]]; then
         read -p "请输入域名 (VMess必须): " DOMAIN
         [[ -z "$DOMAIN" ]] && error "VMess 协议必须提供域名"
@@ -1344,32 +1300,32 @@ install_new() {
         DOMAIN=""
     fi
 
-    # 4. Reality协议 - 直接调用 get_reality_input (和重新部署保持一致)
+    # Reality协议配置
     if [[ "$PROTOCOL_CHOICE" == "1" || "$PROTOCOL_CHOICE" == "3" ]]; then
         get_reality_input
     fi
 
-    # 5. 申请证书
+    # 申请证书
     get_cert
 
-    # 6. 生成配置
+    # 生成配置
     case $PROTOCOL_CHOICE in
         1) gen_reality_server_config ;;
         2) gen_vmess_server_config ;;
         3) gen_dual_server_config ;;
     esac
 
-    # 7. 创建服务并启动
+    # 创建服务并启动
     create_systemd_service
     start_service
     setup_cert_renewal
 
-    # 8. 显示节点信息
+    # 显示节点信息
     gen_qrcode
     gen_client_config
     save_config
 
-    # 9. 开启BBR
+    # 开启BBR
     read -p "是否开启 BBR 加速? [Y/n]: " enable_bbr_choice
     enable_bbr_choice=${enable_bbr_choice:-Y}
     [[ "$enable_bbr_choice" == "y" || "$enable_bbr_choice" == "Y" ]] && enable_bbr

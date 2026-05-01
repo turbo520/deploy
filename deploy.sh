@@ -307,19 +307,22 @@ redeploy_common() {
     restart_and_show
 }
 
-# 配置验证与服务重启
+# ====================== 【修复1】统一的服务启动与展示函数 ======================
+# restart_and_show 同时支持首次启动（enable+start）和重启（restart）两种场景
 restart_and_show() {
     info "验证配置文件合法性..."
     xray run -test -config /usr/local/etc/xray/config.json > /dev/null 2>&1 || error "配置文件验证失败，请检查语法"
 
-    info "重启 Xray 服务..."
+    info "启动/重启 Xray 服务..."
+    # 先 enable 确保开机自启，再用 restart 统一处理首次启动和重启两种场景
+    systemctl enable xray > /dev/null 2>&1
     systemctl restart xray && sleep 2
-    systemctl is-active --quiet xray || error "Xray 服务重启失败，请执行 journalctl -u xray 查看错误日志"
+    systemctl is-active --quiet xray || error "Xray 服务启动失败，请执行 journalctl -u xray 查看错误日志"
 
     gen_qrcode
     gen_client_config
     save_config
-    success "重新部署完成！节点已生效"
+    success "部署完成！节点已生效"
 }
 
 # BBR加速相关
@@ -384,7 +387,6 @@ select_protocol() {
 }
 
 # ====================== 【修复核心】全自动密钥生成函数 ======================
-# 固定行号提取，同一次命令生成的公私钥100%配对，失败自动调用手动兜底
 generate_reality_keys_once() {
     info "开始全自动生成 Reality 密钥对..."
 
@@ -406,22 +408,21 @@ generate_reality_keys_once() {
         return 0
     fi
 
-    # 执行一次密钥生成，把输出按行存入数组（核心修复：固定行顺序提取）
+    # 执行一次密钥生成，把输出按行存入数组
     mapfile -t KEYS_LINES < <($XRAY_CMD x25519 2>&1)
     local exit_code=$?
 
-    # 命令执行失败，走手动兜底
     if [[ $exit_code -ne 0 || ${#KEYS_LINES[@]} -lt 2 ]]; then
         warn "Xray 密钥生成命令执行失败，错误信息: ${KEYS_LINES[*]}"
         _manual_input_keys
         return 0
     fi
 
-    # 固定行提取：第1行=私钥，第2行=公钥（兼容所有Xray版本，无视关键词）
+    # 固定行提取：第1行=私钥，第2行=公钥
     PRIVATE_KEY=$(echo "${KEYS_LINES[0]}" | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
     PUBLIC_KEY=$(echo "${KEYS_LINES[1]}" | awk -F: '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | tr -d '[:space:]')
 
-    # 密钥合法性校验（x25519密钥固定43位base64）
+    # 密钥合法性校验
     if [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && ${#PRIVATE_KEY} -eq 43 && ${#PUBLIC_KEY} -eq 43 ]]; then
         success "密钥全自动生成成功！"
         info "服务端 PrivateKey: ${PRIVATE_KEY}"
@@ -429,12 +430,11 @@ generate_reality_keys_once() {
         return 0
     fi
 
-    # 校验不通过，走手动兜底
     warn "自动生成的密钥校验不通过，进入手动输入模式"
     _manual_input_keys
 }
 
-# 手动输入密钥兜底函数（仅自动生成失败时调用）
+# 手动输入密钥兜底函数
 _manual_input_keys() {
     echo ""
     echo -e "${YELLOW}手动输入密钥操作指南：${NC}"
@@ -466,20 +466,17 @@ _manual_input_keys() {
     done
 }
 
-# Reality回落目标配置（全自动，无人工确认）
+# Reality回落目标配置
 get_reality_input() {
-    # 全自动生成密钥，失败自动调用手动兜底
     generate_reality_keys_once
 
     if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
         error "Reality 密钥生成失败，无法继续配置"
     fi
 
-    # 自动生成Short ID
     SHORT_ID=$(openssl rand -hex 8)
     info "生成的 Short ID: $SHORT_ID"
 
-    # 默认回落目标，无需手动选择
     DEST="www.microsoft.com"
     DEST_PORT=443
     FINGERPRINT="chrome"
@@ -842,8 +839,16 @@ EOF
     success "服务端配置生成完成"
 }
 
-# Systemd服务创建
+# ====================== 【修复2】Systemd服务创建 ======================
+# 官方安装脚本通常已创建服务文件，此函数仅在手动安装时补充创建
 create_systemd_service() {
+    # 如果服务文件已由官方脚本创建，则跳过以避免覆盖官方配置
+    if [[ -f "/etc/systemd/system/xray.service" ]]; then
+        info "Systemd 服务文件已存在，跳过创建"
+        systemctl daemon-reload
+        return 0
+    fi
+
     info "创建 Xray Systemd 服务..."
     cat > /etc/systemd/system/xray.service << EOF
 [Unit]
@@ -863,16 +868,6 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-}
-
-# 服务启动
-start_service() {
-    info "验证配置文件..."
-    xray run -test -config /usr/local/etc/xray/config.json > /dev/null 2>&1 || error "配置文件无效"
-
-    info "启动 Xray 服务..."
-    systemctl enable --now xray && sleep 2
-    systemctl is-active --quiet xray && success "Xray 服务启动成功" || error "Xray 服务启动失败"
 }
 
 # ====================== 链接生成 ======================
@@ -1257,7 +1252,7 @@ show_menu() {
     echo -e "${PURPLE}============================================${NC}"
 }
 
-# ====================== 全新安装流程 ======================
+# ====================== 【修复3】全新安装流程 ======================
 install_new() {
     # 重置所有全局变量
     PRIVATE_KEY=""
@@ -1315,15 +1310,18 @@ install_new() {
         3) gen_dual_server_config ;;
     esac
 
-    # 创建服务并启动
+    # 创建 systemd 服务文件（手动安装时补充）
     create_systemd_service
-    start_service
-    setup_cert_renewal
 
-    # 显示节点信息
-    gen_qrcode
-    gen_client_config
-    save_config
+    # ====================== 核心修复点 ======================
+    # 原代码调用 start_service()（内含 enable+start）后再单独调用展示函数，
+    # 与 redeploy 走不同路径，导致首次部署行为不一致。
+    # 修复：统一调用 restart_and_show()，该函数已改为先 enable 再 restart，
+    # 首次安装和重新部署均走同一套验证→启动→展示流程。
+    restart_and_show
+
+    # 证书续期
+    setup_cert_renewal
 
     # 开启BBR
     read -p "是否开启 BBR 加速? [Y/n]: " enable_bbr_choice

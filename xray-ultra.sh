@@ -1705,70 +1705,58 @@ _redeploy_change_port() {
 
 # ─────────────────────────── 公共：入站安全配置 ───────────────────────────────
 
-# 交互式收集入站安全参数，结果写入局部变量由调用方使用
-# 用法：_collect_inbound_security <变量前缀>
-# 设置：<prefix>_SEC / <prefix>_STREAM_JSON / <prefix>_PUBKEY / <prefix>_SHORTID / <prefix>_DEST
+# 交互式收集入站安全参数
+# 用法：_collect_inbound_security
+# 结果通过全局变量返回（避免 eval/heredoc 多行截断问题）：
+#   _IN_SEC       : 1/2/3
+#   _IN_STREAM    : streamSettings JSON 片段（多行）
+#   _IN_PUBKEY    : Reality PublicKey（仅 sec=1）
+#   _IN_SHORTID   : Reality ShortId（仅 sec=1）
+#   _IN_PRIVKEY   : Reality PrivateKey（仅 sec=1）
+#   _IN_DEST      : Reality SNI（仅 sec=1）
+#   _IN_DOMAIN    : TLS 域名（仅 sec=2）
 _collect_inbound_security() {
-    local prefix="$1"
+    # 清空返回变量
+    _IN_SEC="" _IN_STREAM="" _IN_PUBKEY="" _IN_SHORTID=""
+    _IN_PRIVKEY="" _IN_DEST="www.microsoft.com" _IN_DOMAIN=""
+
     echo -e "\n${YELLOW}入站安全方式:${NC}"
     echo -e "  ${GREEN}1${NC}. Reality（推荐，无需域名）"
     echo -e "  ${GREEN}2${NC}. TLS（需要证书域名）"
     echo -e "  ${GREEN}3${NC}. 无加密（仅内网/受信任环境）"
-    read -p "请选择 [默认 1]: " _sec; _sec=${_sec:-1}
+    read -p "请选择 [默认 1]: " _IN_SEC; _IN_SEC=${_IN_SEC:-1}
 
-    local _dest="www.microsoft.com" _domain="" _priv="" _pub="" _sid="" _stream=""
-
-    case $_sec in
+    case $_IN_SEC in
         1)
             generate_reality_keys_once
-            _priv=$PRIVATE_KEY; _pub=$PUBLIC_KEY
-            _sid=$(openssl rand -hex 8)
-            _stream=$(cat << SS
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "show": false,
-        "dest": "${_dest}:443",
-        "serverNames": ["${_dest}"],
-        "privateKey": "${_priv}",
-        "shortIds": ["${_sid}", ""]
-      }
-    }
-SS
-)
+            _IN_PRIVKEY=$PRIVATE_KEY
+            _IN_PUBKEY=$PUBLIC_KEY
+            _IN_SHORTID=$(openssl rand -hex 8)
+            # 用 printf 写入临时文件，完全规避 heredoc 变量扩展问题
+            printf '    "streamSettings": {\n      "network": "tcp",\n      "security": "reality",\n      "realitySettings": {\n        "show": false,\n        "dest": "%s:443",\n        "serverNames": ["%s"],\n        "privateKey": "%s",\n        "shortIds": ["%s", ""]\n      }\n    }' \
+                "$_IN_DEST" "$_IN_DEST" "$_IN_PRIVKEY" "$_IN_SHORTID" \
+                > /tmp/_xray_instream.txt
+            _IN_STREAM=$(cat /tmp/_xray_instream.txt)
             ;;
         2)
-            read -p "请输入证书域名: " _domain
-            [[ -z "$_domain" ]] && { warn "TLS 模式需要域名"; return 1; }
-            DOMAIN=$_domain; get_cert
-            _stream=$(cat << SS
-    "streamSettings": {
-      "network": "tcp",
-      "security": "tls",
-      "tlsSettings": {
-        "certificates": [{
-          "certificateFile": "/etc/letsencrypt/live/${_domain}/fullchain.pem",
-          "keyFile": "/etc/letsencrypt/live/${_domain}/privkey.pem"
-        }]
-      }
-    }
-SS
-)
+            read -p "请输入证书域名: " _IN_DOMAIN
+            [[ -z "$_IN_DOMAIN" ]] && { warn "TLS 模式需要域名"; return 1; }
+            DOMAIN=$_IN_DOMAIN; get_cert
+            printf '    "streamSettings": {\n      "network": "tcp",\n      "security": "tls",\n      "tlsSettings": {\n        "certificates": [{\n          "certificateFile": "/etc/letsencrypt/live/%s/fullchain.pem",\n          "keyFile": "/etc/letsencrypt/live/%s/privkey.pem"\n        }]\n      }\n    }' \
+                "$_IN_DOMAIN" "$_IN_DOMAIN" \
+                > /tmp/_xray_instream.txt
+            _IN_STREAM=$(cat /tmp/_xray_instream.txt)
             ;;
         3)
-            _stream='"streamSettings": { "network": "tcp" }'
+            _IN_STREAM='    "streamSettings": { "network": "tcp" }'
+            ;;
+        *)
+            warn "无效选择，使用默认 Reality"
+            _IN_SEC=1
+            _collect_inbound_security
+            return
             ;;
     esac
-
-    # 通过 eval 将结果写回调用方的命名变量
-    eval "${prefix}_SEC='$_sec'"
-    eval "${prefix}_STREAM_JSON='$(echo "$_stream" | sed "s/'/'\\\\''/g")'"
-    eval "${prefix}_PUBKEY='$_pub'"
-    eval "${prefix}_SHORTID='$_sid'"
-    eval "${prefix}_DEST='${_dest}'"
-    eval "${prefix}_DOMAIN='${_domain}'"
-    eval "${prefix}_PRIVKEY='${_priv}'"
 }
 
 # ─────────────────────────── 公共：下游服务器收集 ─────────────────────────────
@@ -1908,8 +1896,15 @@ gen_vless_relay_config() {
     info "用户 email: $RELAY_EMAIL  （可用于流量限额）"
 
     # 入站安全
-    local IN_SEC IN_STREAM IN_PUBKEY IN_SHORTID IN_DEST IN_DOMAIN IN_PRIVKEY
-    _collect_inbound_security "IN" || return 1
+    _collect_inbound_security || return 1
+
+    # 读取安全配置结果（全局变量 _IN_*）
+    local IN_SEC=$_IN_SEC
+    local IN_STREAM=$_IN_STREAM
+    local IN_PUBKEY=$_IN_PUBKEY
+    local IN_SHORTID=$_IN_SHORTID
+    local IN_DEST=$_IN_DEST
+    local IN_DOMAIN=$_IN_DOMAIN
 
     # 下游服务器列表（VLESS）
     _collect_downstream_servers "vless" || { warn "至少需要一台下游服务器"; return 1; }
@@ -1921,10 +1916,12 @@ gen_vless_relay_config() {
     local lb_strategy="random"
     [[ "$lb_type" == "2" ]] && lb_strategy="roundRobin"
 
+    mkdir -p /usr/local/etc/xray
+
+    # 先写不含 streamSettings 的骨架
     local BALANCER_TAGS_STR; BALANCER_TAGS_STR=$(IFS=,; echo "${BALANCER_TAGS[*]}")
 
-    mkdir -p /usr/local/etc/xray
-    cat > "$XRAY_CONFIG" << EOF
+    cat > /tmp/_xray_relay_base.json << EOF
 {
   "log": {
     "loglevel": "warning",
@@ -1957,7 +1954,6 @@ gen_vless_relay_config() {
         }],
         "decryption": "none"
       },
-${IN_STREAM},
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
@@ -1981,6 +1977,18 @@ ${OUTBOUNDS_JSON}
   }
 }
 EOF
+
+    # 用 jq 把 streamSettings 注入到 relay-vless-in 入站（完全规避多行字符串插值问题）
+    local stream_json; stream_json=$(cat /tmp/_xray_instream.txt 2>/dev/null || echo '{"network":"tcp"}')
+    # 提取 streamSettings 对象值（去掉外层的 "streamSettings": 键名）
+    local stream_val
+    stream_val=$(echo "$stream_json" | sed 's/^[[:space:]]*"streamSettings":[[:space:]]*//')
+
+    jq --argjson ss "$stream_val" \
+        '(.inbounds[] | select(.tag=="relay-vless-in") | .streamSettings) = $ss' \
+        /tmp/_xray_relay_base.json > "$XRAY_CONFIG"
+
+    rm -f /tmp/_xray_relay_base.json /tmp/_xray_instream.txt
 
     xray run -test -config "$XRAY_CONFIG" > /dev/null 2>&1 \
         || error "配置验证失败，请检查下游参数"
@@ -2053,8 +2061,15 @@ gen_vless_to_socks5_relay() {
     info "用户 email: $RELAY_EMAIL  （可用于流量限额）"
 
     # 入站安全
-    local IN_SEC IN_STREAM IN_PUBKEY IN_SHORTID IN_DEST IN_DOMAIN IN_PRIVKEY
-    _collect_inbound_security "IN" || return 1
+    _collect_inbound_security || return 1
+
+    # 读取安全配置结果（全局变量 _IN_*）
+    local IN_SEC=$_IN_SEC
+    local IN_STREAM=$_IN_STREAM
+    local IN_PUBKEY=$_IN_PUBKEY
+    local IN_SHORTID=$_IN_SHORTID
+    local IN_DEST=$_IN_DEST
+    local IN_DOMAIN=$_IN_DOMAIN
 
     # 下游 Socks5 服务器列表
     _collect_downstream_servers "socks5" || { warn "至少需要一台下游 Socks5 服务器"; return 1; }
@@ -2066,10 +2081,11 @@ gen_vless_to_socks5_relay() {
     local lb_strategy="random"
     [[ "$lb_type" == "2" ]] && lb_strategy="roundRobin"
 
+    mkdir -p /usr/local/etc/xray
+
     local BALANCER_TAGS_STR; BALANCER_TAGS_STR=$(IFS=,; echo "${BALANCER_TAGS[*]}")
 
-    mkdir -p /usr/local/etc/xray
-    cat > "$XRAY_CONFIG" << EOF
+    cat > /tmp/_xray_relay_base.json << EOF
 {
   "log": {
     "loglevel": "warning",
@@ -2102,7 +2118,6 @@ gen_vless_to_socks5_relay() {
         }],
         "decryption": "none"
       },
-${IN_STREAM},
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
   ],
@@ -2126,6 +2141,17 @@ ${OUTBOUNDS_JSON}
   }
 }
 EOF
+
+    # jq 注入 streamSettings
+    local stream_val
+    stream_val=$(cat /tmp/_xray_instream.txt 2>/dev/null \
+        | sed 's/^[[:space:]]*"streamSettings":[[:space:]]*//')
+
+    jq --argjson ss "$stream_val" \
+        '(.inbounds[] | select(.tag=="relay-vless-s5-in") | .streamSettings) = $ss' \
+        /tmp/_xray_relay_base.json > "$XRAY_CONFIG"
+
+    rm -f /tmp/_xray_relay_base.json /tmp/_xray_instream.txt
 
     xray run -test -config "$XRAY_CONFIG" > /dev/null 2>&1 \
         || error "配置验证失败，请检查下游参数"

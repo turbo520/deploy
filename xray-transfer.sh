@@ -2284,47 +2284,79 @@ gen_socks5_config() {
     read -p "启用 UDP? [Y/n]: " udp_yn; udp_yn=${udp_yn:-Y}
     [[ "$udp_yn" =~ ^[Nn]$ ]] && UDP=false
 
-    local AUTH_BLOCK
-    $S5_AUTH \
-        && AUTH_BLOCK="\"auth\":\"password\",\"accounts\":[${S5_ACCOUNTS_JSON}]," \
-        || AUTH_BLOCK='"auth":"noauth",'
+    # 把账号列表写入临时文件，避免 heredoc 里嵌入多行变量
+    echo "${S5_ACCOUNTS_JSON:-[]}" > /tmp/_xray_s5_accounts.json
 
-    local S5_INBOUND
-    S5_INBOUND=$(python3 -c "
-import json
-ib = {
-    'tag': 'socks5-in',
-    'listen': '${S5_LISTEN}',
-    'port': ${S5_PORT},
-    'protocol': 'socks',
-    'settings': json.loads('{${AUTH_BLOCK}\"udp\":${UDP}}')
-}
-print(json.dumps(ib, indent=2))
-")
+    # ── 用 python3 生成完整 config，所有布尔值在 Python 层处理 ───────────────
+    local py_auth
+    $S5_AUTH && py_auth="password" || py_auth="noauth"
+    local py_udp
+    $UDP && py_udp="True" || py_udp="False"
 
     if $MERGE; then
         python3 - << PYEOF
 import json
+
 cfg = json.load(open('${XRAY_CONFIG}'))
+
+# 构建 settings
+settings = {'auth': '${py_auth}', 'udp': ${py_udp}}
+if '${py_auth}' == 'password':
+    raw = '${S5_ACCOUNTS_JSON}'
+    # 解析账号列表
+    try:
+        settings['accounts'] = json.loads('[' + raw + ']') if not raw.startswith('[') else json.loads(raw)
+    except Exception:
+        settings['accounts'] = []
+
+new_ib = {
+    'tag': 'socks5-in',
+    'listen': '${S5_LISTEN}',
+    'port': ${S5_PORT},
+    'protocol': 'socks',
+    'settings': settings
+}
+
 cfg['inbounds'] = [ib for ib in cfg['inbounds'] if ib.get('tag') != 'socks5-in']
-cfg['inbounds'].append(${S5_INBOUND})
-with open('${XRAY_CONFIG}','w') as f:
+cfg['inbounds'].append(new_ib)
+
+with open('${XRAY_CONFIG}', 'w') as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
-print("Socks5 入站已合并")
+print("Socks5 入站已合并到现有配置")
 PYEOF
     else
         python3 - << PYEOF
 import json
+
+settings = {'auth': '${py_auth}', 'udp': ${py_udp}}
+if '${py_auth}' == 'password':
+    raw = '${S5_ACCOUNTS_JSON}'
+    try:
+        settings['accounts'] = json.loads('[' + raw + ']') if not raw.startswith('[') else json.loads(raw)
+    except Exception:
+        settings['accounts'] = []
+
 config = {
-    "log": {"loglevel":"warning",
-            "access":"${XRAY_LOG_DIR}/access.log",
-            "error":"${XRAY_LOG_DIR}/error.log"},
-    "inbounds":  [${S5_INBOUND}],
-    "outbounds": [{"tag":"direct","protocol":"freedom"},
-                  {"tag":"block","protocol":"blackhole"}],
-    "routing": {"rules":[{"type":"field","ip":["geoip:private"],"outboundTag":"block"}]}
+    'log': {'loglevel': 'warning',
+            'access': '${XRAY_LOG_DIR}/access.log',
+            'error':  '${XRAY_LOG_DIR}/error.log'},
+    'inbounds': [{
+        'tag': 'socks5-in',
+        'listen': '${S5_LISTEN}',
+        'port': ${S5_PORT},
+        'protocol': 'socks',
+        'settings': settings
+    }],
+    'outbounds': [
+        {'tag': 'direct', 'protocol': 'freedom'},
+        {'tag': 'block',  'protocol': 'blackhole'}
+    ],
+    'routing': {'rules': [
+        {'type': 'field', 'ip': ['geoip:private'], 'outboundTag': 'block'}
+    ]}
 }
-with open('${XRAY_CONFIG}','w') as f:
+
+with open('${XRAY_CONFIG}', 'w') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
 print("Socks5 配置生成成功")
 PYEOF
